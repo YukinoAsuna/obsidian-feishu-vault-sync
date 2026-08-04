@@ -1,0 +1,6 @@
+node_modules/
+main.js
+main.js.map
+feishu-vault-sync-*.zip
+*.log
+.DS_Store

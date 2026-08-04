@@ -1,0 +1,53 @@
+.feishu-vault-sync-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 0.5rem;
+}
+
+.feishu-vault-sync-warning {
+  background: var(--background-modifier-error-hover);
+  border-radius: var(--radius-s);
+  color: var(--text-error);
+  padding: 0.75rem;
+}
+
+.feishu-vault-sync-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.feishu-vault-sync-login {
+  text-align: center;
+}
+
+.feishu-vault-sync-qr {
+  align-items: center;
+  background: white;
+  border-radius: var(--radius-m);
+  display: flex;
+  justify-content: center;
+  margin: 1rem auto;
+  min-height: 280px;
+  padding: 0.75rem;
+  width: min(304px, 100%);
+}
+
+.feishu-vault-sync-qr img {
+  display: block;
+  height: auto;
+  max-width: 100%;
+}
+
+.feishu-vault-sync-login-status {
+  font-weight: var(--font-semibold);
+  margin: 0.75rem 0;
+}
+
+.feishu-vault-sync-login-error {
+  color: var(--text-error);
+}
+
+.feishu-vault-sync-login-success {
+  color: var(--text-success);
+}
