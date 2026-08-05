@@ -1,6 +1,6 @@
 {
   "name": "obsidian-feishu-vault-sync",
-  "version": "0.4.1",
+  "version": "0.4.4",
   "description": "Scan to connect Feishu, then mirror an Obsidian vault with optional two-way sync.",
   "main": "main.js",
   "scripts": {

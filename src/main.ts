@@ -1,5 +1,6 @@
 import {
   App,
+  Command,
   MarkdownView,
   Modal,
   Notice,
@@ -78,22 +79,11 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       }
     });
     this.addCommand({
-      id: "save-and-sync-active-file",
-      name: "保存并立即同步当前文件",
-      hotkeys: [{ modifiers: ["Mod"], key: "s" }],
-      checkCallback: (checking) => {
-        if (!this.settings.syncOnSave) return false;
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view?.file || view.getMode() !== "source") return false;
-        if (!checking) void this.saveAndSyncView(view);
-        return true;
-      }
-    });
-    this.addCommand({
       id: "test-connection",
       name: "测试飞书连接",
       callback: () => void this.testConnection()
     });
+    this.hookCoreSaveCommand();
     this.addSettingTab(new FeishuVaultSyncSettingTab(this.app, this));
     this.reschedule();
 
@@ -125,6 +115,33 @@ export default class FeishuVaultSyncPlugin extends Plugin {
 
   openSyncManager(): void {
     new FileSyncManagerModal(this.app, this).open();
+  }
+
+  private hookCoreSaveCommand(): void {
+    const commandManager = (this.app as App & {
+      commands?: { commands: Record<string, Command> };
+    }).commands;
+    const saveCommand = commandManager?.commands["editor:save-file"];
+    const originalCheckCallback = saveCommand?.checkCallback;
+    if (!saveCommand || !originalCheckCallback) {
+      console.warn("Feishu Vault Sync: Obsidian core save command is unavailable");
+      return;
+    }
+
+    const wrappedCheckCallback = (checking: boolean): boolean | void => {
+      const result = originalCheckCallback.call(saveCommand, checking);
+      if (!checking && result && this.settings.syncOnSave) {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view?.file && view.getMode() === "source") void this.saveAndSyncView(view);
+      }
+      return result;
+    };
+    saveCommand.checkCallback = wrappedCheckCallback;
+    this.register(() => {
+      if (saveCommand.checkCallback === wrappedCheckCallback) {
+        saveCommand.checkCallback = originalCheckCallback;
+      }
+    });
   }
 
   private async saveAndSyncView(view: MarkdownView): Promise<void> {
