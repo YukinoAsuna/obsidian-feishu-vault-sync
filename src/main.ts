@@ -1,5 +1,6 @@
 import {
   App,
+  Command,
   MarkdownView,
   Modal,
   Notice,
@@ -82,17 +83,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       name: "测试飞书连接",
       callback: () => void this.testConnection()
     });
-    this.registerDomEvent(document, "keydown", (event: KeyboardEvent) => {
-      if (!this.settings.syncOnSave || event.repeat) return;
-      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
-      if (event.key.toLocaleLowerCase() !== "s") return;
-      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (!view?.file || !view.editor.hasFocus()) return;
-      const path = view.file.path;
-      void view.save()
-        .then(() => this.scheduleSaveSync(path))
-        .catch((error: unknown) => console.error("Feishu Vault Sync: failed to save before sync", error));
-    });
+    this.hookCoreSaveCommand();
     this.addSettingTab(new FeishuVaultSyncSettingTab(this.app, this));
     this.reschedule();
 
@@ -124,6 +115,45 @@ export default class FeishuVaultSyncPlugin extends Plugin {
 
   openSyncManager(): void {
     new FileSyncManagerModal(this.app, this).open();
+  }
+
+  private hookCoreSaveCommand(): void {
+    const commandManager = (this.app as App & {
+      commands?: { commands: Record<string, Command> };
+    }).commands;
+    const saveCommand = commandManager?.commands["editor:save-file"];
+    const originalCheckCallback = saveCommand?.checkCallback;
+    if (!saveCommand || !originalCheckCallback) {
+      console.warn("Feishu Vault Sync: Obsidian core save command is unavailable");
+      return;
+    }
+
+    const wrappedCheckCallback = (checking: boolean): boolean | void => {
+      const result = originalCheckCallback.call(saveCommand, checking);
+      if (!checking && result && this.settings.syncOnSave) {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view?.file && view.getMode() === "source") void this.saveAndSyncView(view);
+      }
+      return result;
+    };
+    saveCommand.checkCallback = wrappedCheckCallback;
+    this.register(() => {
+      if (saveCommand.checkCallback === wrappedCheckCallback) {
+        saveCommand.checkCallback = originalCheckCallback;
+      }
+    });
+  }
+
+  private async saveAndSyncView(view: MarkdownView): Promise<void> {
+    const file = view.file;
+    if (!file) return;
+    try {
+      await view.save();
+      this.scheduleSaveSync(file.path);
+    } catch (error) {
+      console.error("Feishu Vault Sync: failed to save before sync", error);
+      new Notice(`保存当前文件失败：${error instanceof Error ? error.message : String(error)}`, 8000);
+    }
   }
 
   private scheduleSaveSync(path: string): void {
