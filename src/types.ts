@@ -1,4 +1,5 @@
 export type SyncDirection = "push" | "bidirectional";
+export type MarkdownSyncMode = "file" | "docx";
 
 export interface FeishuSyncSettings {
   appId: string;
@@ -7,6 +8,9 @@ export interface FeishuSyncSettings {
   userOpenId: string;
   connectedAt: number;
   direction: SyncDirection;
+  markdownMode: MarkdownSyncMode;
+  createDocxVersions: boolean;
+  docxAttachmentFolder: string;
   intervalMinutes: number;
   autoSyncEnabled: boolean;
   syncOnSave: boolean;
@@ -17,6 +21,7 @@ export interface FeishuSyncSettings {
 
 export interface SyncEntry {
   remoteToken: string;
+  remoteType?: string;
   remoteModifiedTime: number;
   localHash: string;
   localMtime: number;
@@ -37,7 +42,7 @@ export interface SyncRunReport {
 }
 
 export interface SyncState {
-  version: 2;
+  version: 3;
   lastSyncAt: number;
   entries: Record<string, SyncEntry>;
   disabledPaths: string[];
@@ -61,6 +66,7 @@ export interface RemoteNode {
 export interface RemoteTree {
   folders: Map<string, RemoteNode>;
   files: Map<string, RemoteNode>;
+  duplicates: Map<string, RemoteNode[]>;
   unsupported: Map<string, RemoteNode>;
 }
 
@@ -85,6 +91,9 @@ export const DEFAULT_SETTINGS: FeishuSyncSettings = {
   userOpenId: "",
   connectedAt: 0,
   direction: "push",
+  markdownMode: "file",
+  createDocxVersions: true,
+  docxAttachmentFolder: "Feishu Attachments",
   intervalMinutes: 30,
   autoSyncEnabled: true,
   syncOnSave: true,
@@ -99,7 +108,7 @@ export const DEFAULT_SETTINGS: FeishuSyncSettings = {
 };
 
 export const DEFAULT_STATE: SyncState = {
-  version: 2,
+  version: 3,
   lastSyncAt: 0,
   entries: {},
   disabledPaths: [],

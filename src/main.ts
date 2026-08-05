@@ -104,9 +104,18 @@ export default class FeishuVaultSyncPlugin extends Plugin {
   async updateSettings(patch: Partial<FeishuSyncSettings>): Promise<void> {
     const previousInterval = this.settings.intervalMinutes;
     const previousAutoSyncEnabled = this.settings.autoSyncEnabled;
+    const previousMarkdownMode = this.settings.markdownMode;
     this.settings = { ...this.settings, ...patch };
     this.settings.intervalMinutes = Math.max(1, Math.min(10080, this.settings.intervalMinutes || 30));
     await this.persist();
+    if (this.settings.markdownMode !== previousMarkdownMode) {
+      for (const path of Object.keys(this.state.entries)) {
+        if (path.toLowerCase().endsWith(".md")) delete this.state.entries[path];
+      }
+      this.remoteFiles = undefined;
+      this.remoteStatusCheckedAt = 0;
+      await this.persist();
+    }
     if (
       this.settings.intervalMinutes !== previousInterval
       || this.settings.autoSyncEnabled !== previousAutoSyncEnabled
@@ -323,6 +332,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
           statuses.push({ path, category: "pending", message: "飞书副本不存在" });
         } else if (remote && (
           entry.remoteToken !== remote.token
+          || Boolean(entry.remoteType && entry.remoteType !== remote.type)
           || remote.modifiedTime > entry.remoteModifiedTime + 1
         )) {
           statuses.push({ path, category: "pending", message: "飞书文件在上次同步后有变化" });
@@ -361,7 +371,9 @@ export default class FeishuVaultSyncPlugin extends Plugin {
     const notice = new Notice("正在测试飞书连接…", 0);
     try {
       await this.client.testConnection();
-      notice.setMessage("飞书连接成功，根文件夹可以访问");
+      notice.setMessage(this.settings.markdownMode === "docx"
+        ? "飞书连接成功，根文件夹和在线文档转换权限可以访问"
+        : "飞书连接成功，根文件夹可以访问");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       notice.setMessage(`飞书连接失败：${message}`);
@@ -397,7 +409,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
         signal: abortController.signal,
         appPreset: {
           name: "Obsidian Vault Sync",
-          desc: "将 Obsidian Vault 按原始目录和文件格式同步到飞书云盘"
+          desc: "将 Obsidian Vault 按原始目录同步到飞书云盘，并可把 Markdown 转为在线文档"
         },
         addons: {
           preset: false,
@@ -405,6 +417,11 @@ export default class FeishuVaultSyncPlugin extends Plugin {
             tenant: [
               "drive:drive",
               "drive:drive.metadata:readonly",
+              "drive:drive:version",
+              "docx:document",
+              "docx:document.block:convert",
+              "docs:document.media:upload",
+              "docs:document.media:download",
             ]
           }
         },
@@ -517,7 +534,8 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       () => this.settings,
       this.state,
       () => this.persist(),
-      (message) => this.setStatus(`飞书同步：${message}`)
+      (message) => this.setStatus(`飞书同步：${message}`),
+      (linkPath, sourcePath) => this.app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath)
     );
   }
 
@@ -563,7 +581,9 @@ class FeishuVaultSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "飞书云盘同步" });
     containerEl.createEl("p", {
-      text: "插件会把笔记和附件作为原始文件同步到飞书，以无损保留 Obsidian 的 Markdown、YAML、双链和目录结构。"
+      text: this.plugin.settings.markdownMode === "docx"
+        ? "Markdown 笔记会同步为可编辑的飞书在线文档并保留历史版本；其他附件仍按原始文件同步，目录结构保持不变。"
+        : "插件会把笔记和附件作为原始文件同步到飞书，以无损保留 Obsidian 的 Markdown、YAML、双链和目录结构。"
     });
 
     const connectedAt = this.plugin.settings.connectedAt
@@ -591,6 +611,51 @@ class FeishuVaultSyncSettingTab extends PluginSettingTab {
           await this.plugin.disconnectFeishu();
           this.display();
         }));
+    }
+
+    const markdownModeSetting = new Setting(containerEl)
+      .setName("Markdown 在飞书中的格式")
+      .setDesc(this.plugin.settings.markdownMode === "docx"
+        ? "在线文档模式：原地更新同一文档、支持飞书历史记录和图片素材双向同步。首次启用后请重新扫码授权"
+        : "原始文件模式：继续把 .md 作为普通云盘文件上传");
+    markdownModeSetting.addDropdown((dropdown) => dropdown
+      .addOption("file", "普通 .md 文件（兼容模式）")
+      .addOption("docx", "飞书在线文档（保留历史）")
+      .setValue(this.plugin.settings.markdownMode)
+      .onChange(async (value) => {
+        await this.plugin.updateSettings({
+          markdownMode: value as FeishuSyncSettings["markdownMode"]
+        });
+        if (value === "docx") {
+          new Notice("已启用在线文档模式。请点击“重新扫码授权”批准文档和图片权限，然后执行全量同步", 10000);
+        }
+        this.display();
+      }));
+    if (this.plugin.settings.markdownMode === "docx") {
+      markdownModeSetting.addButton((button) => button
+        .setCta()
+        .setButtonText("迁移/同步全部笔记")
+        .onClick(async () => {
+          await this.plugin.runSync("在线文档迁移");
+          this.display();
+        }));
+
+      new Setting(containerEl)
+        .setName("同步前创建飞书历史版本")
+        .setDesc("默认开启；更新已有在线文档前创建一个带时间的可恢复版本")
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.createDocxVersions)
+          .onChange(async (value) => this.plugin.updateSettings({ createDocxVersions: value })));
+
+      new Setting(containerEl)
+        .setName("飞书图片写回目录")
+        .setDesc("从飞书在线文档写回的图片和附件保存在 Vault 的这个目录中")
+        .addText((text) => text
+          .setPlaceholder("Feishu Attachments")
+          .setValue(this.plugin.settings.docxAttachmentFolder)
+          .onChange(async (value) => this.plugin.updateSettings({
+            docxAttachmentFolder: normalizeVaultPath(value) || "Feishu Attachments"
+          })));
     }
 
     new Setting(containerEl)
