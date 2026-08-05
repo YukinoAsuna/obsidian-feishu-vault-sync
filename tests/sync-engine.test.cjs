@@ -114,6 +114,8 @@ function settings(direction = "push") {
     connectedAt: 1,
     direction,
     intervalMinutes: 30,
+    autoSyncEnabled: true,
+    syncOnSave: true,
     syncOnStartup: true,
     propagateDeletions: false,
     excludedPatterns: []

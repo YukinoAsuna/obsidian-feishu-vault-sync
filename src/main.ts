@@ -1,5 +1,6 @@
 import {
   App,
+  MarkdownView,
   Modal,
   Notice,
   Plugin,
@@ -39,6 +40,8 @@ export default class FeishuVaultSyncPlugin extends Plugin {
   private statusBarItem!: HTMLElement;
   private loginAbortController: AbortController | undefined;
   private remoteFiles: Map<string, RemoteNode> | undefined;
+  private readonly saveSyncQueue = new Set<string>();
+  private saveSyncTimer: number | undefined;
   remoteStatusCheckedAt = 0;
 
   async onload(): Promise<void> {
@@ -79,6 +82,17 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       name: "测试飞书连接",
       callback: () => void this.testConnection()
     });
+    this.registerDomEvent(document, "keydown", (event: KeyboardEvent) => {
+      if (!this.settings.syncOnSave || event.repeat) return;
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+      if (event.key.toLocaleLowerCase() !== "s") return;
+      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (!view?.file || !view.editor.hasFocus()) return;
+      const path = view.file.path;
+      void view.save()
+        .then(() => this.scheduleSaveSync(path))
+        .catch((error: unknown) => console.error("Feishu Vault Sync: failed to save before sync", error));
+    });
     this.addSettingTab(new FeishuVaultSyncSettingTab(this.app, this));
     this.reschedule();
 
@@ -92,19 +106,52 @@ export default class FeishuVaultSyncPlugin extends Plugin {
 
   onunload(): void {
     if (this.intervalId !== undefined) window.clearInterval(this.intervalId);
+    if (this.saveSyncTimer !== undefined) window.clearTimeout(this.saveSyncTimer);
     this.loginAbortController?.abort();
   }
 
   async updateSettings(patch: Partial<FeishuSyncSettings>): Promise<void> {
     const previousInterval = this.settings.intervalMinutes;
+    const previousAutoSyncEnabled = this.settings.autoSyncEnabled;
     this.settings = { ...this.settings, ...patch };
     this.settings.intervalMinutes = Math.max(1, Math.min(10080, this.settings.intervalMinutes || 30));
     await this.persist();
-    if (this.settings.intervalMinutes !== previousInterval) this.reschedule();
+    if (
+      this.settings.intervalMinutes !== previousInterval
+      || this.settings.autoSyncEnabled !== previousAutoSyncEnabled
+    ) this.reschedule();
   }
 
   openSyncManager(): void {
     new FileSyncManagerModal(this.app, this).open();
+  }
+
+  private scheduleSaveSync(path: string): void {
+    const normalized = normalizeVaultPath(path);
+    if (!normalized || !this.isConnected()) return;
+    if (isExcluded(normalized, this.settings.excludedPatterns)) return;
+    if (this.state.disabledPaths.map(normalizeVaultPath).includes(normalized)) return;
+    this.saveSyncQueue.add(normalized);
+    if (this.saveSyncTimer !== undefined) window.clearTimeout(this.saveSyncTimer);
+    this.saveSyncTimer = window.setTimeout(() => void this.flushSaveSyncQueue(), 180);
+  }
+
+  private async flushSaveSyncQueue(): Promise<void> {
+    this.saveSyncTimer = undefined;
+    if (!this.settings.syncOnSave || !this.isConnected()) {
+      this.saveSyncQueue.clear();
+      return;
+    }
+    if (this.syncing) {
+      this.saveSyncTimer = window.setTimeout(() => void this.flushSaveSyncQueue(), 500);
+      return;
+    }
+    const disabled = new Set(this.state.disabledPaths.map(normalizeVaultPath));
+    const paths = [...this.saveSyncQueue].filter((path) => (
+      !disabled.has(path) && !isExcluded(path, this.settings.excludedPatterns)
+    ));
+    this.saveSyncQueue.clear();
+    if (paths.length > 0) await this.syncSelectedFiles(paths, "保存");
   }
 
   async runSync(trigger: string): Promise<void> {
@@ -142,7 +189,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
     }
   }
 
-  async syncSelectedFiles(paths: string[]): Promise<void> {
+  async syncSelectedFiles(paths: string[], trigger = "选中"): Promise<void> {
     const selected = [...new Set(paths.map(normalizeVaultPath).filter(Boolean))];
     if (selected.length === 0) {
       new Notice("请先选择要同步的文件");
@@ -160,21 +207,22 @@ export default class FeishuVaultSyncPlugin extends Plugin {
     this.syncing = true;
     this.remoteFiles = undefined;
     this.remoteStatusCheckedAt = 0;
-    this.setStatus(`飞书同步：正在同步选中的 ${selected.length} 个文件…`);
-    const notice = new Notice(`正在同步选中的 ${selected.length} 个文件…`, 0);
+    const actionLabel = trigger === "保存" ? "保存后同步" : "选中文件同步";
+    this.setStatus(`飞书同步：${actionLabel}中（${selected.length}）…`);
+    const notice = new Notice(`${actionLabel}：${selected.length} 个文件…`, 0);
     try {
       const stats = await this.createSyncEngine().syncSelected(selected);
       const summary = this.formatStats(stats);
       this.setStatus(`飞书同步：${summary}`);
-      notice.setMessage(`选中文件同步完成：${summary}`);
+      notice.setMessage(`${actionLabel}完成：${summary}`);
       window.setTimeout(() => notice.hide(), stats.errors.length > 0 ? 10000 : 5000);
       if (stats.errors.length > 0) {
         console.warn("Feishu Vault Sync selected files completed with errors", stats.errors);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.setStatus("飞书同步：选中文件同步失败");
-      notice.setMessage(`选中文件同步失败：${message}`);
+      this.setStatus(`飞书同步：${actionLabel}失败`);
+      notice.setMessage(`${actionLabel}失败：${message}`);
       window.setTimeout(() => notice.hide(), 10000);
       console.error("Feishu Vault Sync selected files failed", error);
     } finally {
@@ -448,6 +496,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       window.clearInterval(this.intervalId);
       this.intervalId = undefined;
     }
+    if (!this.settings.autoSyncEnabled) return;
     const milliseconds = Math.max(1, this.settings.intervalMinutes) * 60 * 1000;
     this.intervalId = window.setInterval(() => void this.runSync("定时"), milliseconds);
     this.registerInterval(this.intervalId);
@@ -526,12 +575,32 @@ class FeishuVaultSyncSettingTab extends PluginSettingTab {
         })));
 
     new Setting(containerEl)
+      .setName("Ctrl+S 后同步当前文件")
+      .setDesc("默认开启；在 Markdown 编辑器按 Ctrl+S 后，等本地保存完成便立即上传当前文件。已取消同步的文件不会被恢复")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.syncOnSave)
+        .onChange(async (value) => this.plugin.updateSettings({ syncOnSave: value })));
+
+    new Setting(containerEl)
+      .setName("自动定时同步")
+      .setDesc("开启后按下面设置的分钟数周期性同步整个 Vault")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.autoSyncEnabled)
+        .onChange(async (value) => {
+          await this.plugin.updateSettings({ autoSyncEnabled: value });
+          this.display();
+        }));
+
+    new Setting(containerEl)
       .setName("同步间隔（分钟）")
-      .setDesc("最短 1 分钟；修改后自动重新安排定时同步")
+      .setDesc(this.plugin.settings.autoSyncEnabled
+        ? "最短 1 分钟；修改后自动重新安排定时同步"
+        : "自动定时同步已关闭")
       .addText((text) => {
         text.inputEl.type = "number";
         text.inputEl.min = "1";
         text.inputEl.max = "10080";
+        text.setDisabled(!this.plugin.settings.autoSyncEnabled);
         text
           .setValue(String(this.plugin.settings.intervalMinutes))
           .onChange(async (value) => this.plugin.updateSettings({
@@ -812,6 +881,40 @@ class FileSyncManagerModal extends Modal {
         this.render();
       });
     }
+
+    new Setting(contentEl)
+      .setName("Ctrl+S 立即同步当前文件")
+      .setDesc("在 Markdown 编辑器保存后立即上传当前文件")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.syncOnSave)
+        .onChange(async (value) => this.plugin.updateSettings({ syncOnSave: value })));
+
+    new Setting(contentEl)
+      .setName("自动定时同步")
+      .setDesc(this.plugin.settings.autoSyncEnabled
+        ? `当前每 ${this.plugin.settings.intervalMinutes} 分钟同步一次`
+        : "当前已关闭")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.autoSyncEnabled)
+        .onChange(async (value) => {
+          await this.plugin.updateSettings({ autoSyncEnabled: value });
+          this.render();
+        }));
+
+    new Setting(contentEl)
+      .setName("自动同步间隔（分钟）")
+      .setDesc("范围 1–10080 分钟")
+      .addText((text) => {
+        text.inputEl.type = "number";
+        text.inputEl.min = "1";
+        text.inputEl.max = "10080";
+        text.setDisabled(!this.plugin.settings.autoSyncEnabled);
+        text
+          .setValue(String(this.plugin.settings.intervalMinutes))
+          .onChange(async (value) => this.plugin.updateSettings({
+            intervalMinutes: Number.parseInt(value, 10) || 30
+          }));
+      });
 
     const lastSync = this.plugin.state.lastSyncAt
       ? new Date(this.plugin.state.lastSyncAt).toLocaleString()

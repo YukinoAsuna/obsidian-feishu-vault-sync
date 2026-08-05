@@ -8,6 +8,8 @@ export interface FeishuSyncSettings {
   connectedAt: number;
   direction: SyncDirection;
   intervalMinutes: number;
+  autoSyncEnabled: boolean;
+  syncOnSave: boolean;
   syncOnStartup: boolean;
   propagateDeletions: boolean;
   excludedPatterns: string[];
@@ -84,6 +86,8 @@ export const DEFAULT_SETTINGS: FeishuSyncSettings = {
   connectedAt: 0,
   direction: "push",
   intervalMinutes: 30,
+  autoSyncEnabled: true,
+  syncOnSave: true,
   syncOnStartup: true,
   propagateDeletions: false,
   excludedPatterns: [
