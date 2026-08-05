@@ -36,17 +36,7 @@ export class SyncEngine {
 
   async sync(): Promise<SyncStats> {
     const settings = this.getSettings();
-    const stats: SyncStats = {
-      uploaded: 0,
-      downloaded: 0,
-      deletedRemote: 0,
-      deletedLocal: 0,
-      conflicts: 0,
-      skipped: 0,
-      errors: [],
-      startedAt: Date.now(),
-      finishedAt: 0
-    };
+    const stats = this.createStats();
 
     this.onProgress("正在读取飞书目录…");
     const remoteTree = await this.client.listTree(settings.rootFolderToken.trim());
@@ -60,18 +50,80 @@ export class SyncEngine {
     }
 
     stats.skipped += remoteTree.unsupported.size;
-    this.state.lastSyncAt = Date.now();
-    stats.finishedAt = this.state.lastSyncAt;
-    await this.persist();
+    await this.finish(stats);
     this.onProgress("同步完成");
     return stats;
   }
 
-  private getLocalFiles(settings: FeishuSyncSettings): Map<string, LocalSnapshot> {
+  async syncSelected(paths: string[]): Promise<SyncStats> {
+    const settings = this.getSettings();
+    const stats = this.createStats();
+    const selected = new Set(paths.map(normalizeVaultPath).filter(Boolean));
+    this.state.disabledPaths = this.state.disabledPaths.filter((path) => !selected.has(path));
+
+    this.onProgress("正在读取飞书目录…");
+    const remoteTree = await this.client.listTree(settings.rootFolderToken.trim());
+    const localFiles = this.getLocalFiles(settings, false);
+    for (const path of [...selected].sort()) {
+      const local = localFiles.get(path);
+      if (!local) {
+        this.addFailure(stats, path, "本地文件不存在或已被全局排除规则忽略");
+        continue;
+      }
+      try {
+        const { data, hash } = await this.readLocal(local);
+        await this.uploadLocal(path, local, data, hash, remoteTree.files.get(path), remoteTree, stats);
+      } catch (error) {
+        this.addFailure(stats, path, error);
+      }
+    }
+
+    await this.finish(stats);
+    this.onProgress("选中文件同步完成");
+    return stats;
+  }
+
+  async cancelSync(paths: string[]): Promise<SyncStats> {
+    const settings = this.getSettings();
+    const stats = this.createStats();
+    const selected = [...new Set(paths.map(normalizeVaultPath).filter(Boolean))].sort();
+
+    this.onProgress("正在读取飞书目录…");
+    const remoteTree = await this.client.listTree(settings.rootFolderToken.trim());
+    const disabled = new Set(this.state.disabledPaths.map(normalizeVaultPath));
+    for (const path of selected) {
+      try {
+        const remote = remoteTree.files.get(path);
+        if (remote) {
+          this.onProgress(`删除飞书文件：${path}`);
+          await this.client.deleteNode(remote.token, "file");
+          remoteTree.files.delete(path);
+          stats.deletedRemote += 1;
+        }
+        delete this.state.entries[path];
+        disabled.add(path);
+        this.markSuccess(stats, path);
+      } catch (error) {
+        this.addFailure(stats, path, error);
+      }
+    }
+    this.state.disabledPaths = [...disabled].sort();
+
+    await this.finish(stats);
+    this.onProgress("取消同步完成");
+    return stats;
+  }
+
+  private getLocalFiles(
+    settings: FeishuSyncSettings,
+    respectDisabled = true
+  ): Map<string, LocalSnapshot> {
     const files = new Map<string, LocalSnapshot>();
+    const disabled = new Set(this.state.disabledPaths.map(normalizeVaultPath));
     for (const file of this.vault.getFiles()) {
       const path = normalizeVaultPath(file.path);
       if (isExcluded(path, settings.excludedPatterns)) continue;
+      if (respectDisabled && disabled.has(path)) continue;
       files.set(path, { file });
     }
     return files;
@@ -115,9 +167,10 @@ export class SyncEngine {
         } else if (remote) {
           this.state.entries[path] = this.makeEntry(local, hash, remote, entry.emptyPlaceholder);
           stats.skipped += 1;
+          this.markSuccess(stats, path);
         }
       } catch (error) {
-        stats.errors.push(`${path}: ${this.errorMessage(error)}`);
+        this.addFailure(stats, path, error);
       }
     }
 
@@ -127,10 +180,11 @@ export class SyncEngine {
       const remote = tree.files.get(path);
       if (!remote) {
         delete this.state.entries[path];
+        this.markSuccess(stats, path);
         continue;
       }
       if (this.remoteChanged(entry, remote)) {
-        stats.errors.push(`${path}: 本地已删除，但飞书版本也有变化，已保留远端文件`);
+        this.addFailure(stats, path, "本地已删除，但飞书版本也有变化，已保留远端文件");
         continue;
       }
       try {
@@ -139,8 +193,9 @@ export class SyncEngine {
         tree.files.delete(path);
         delete this.state.entries[path];
         stats.deletedRemote += 1;
+        this.markSuccess(stats, path);
       } catch (error) {
-        stats.errors.push(`${path}: ${this.errorMessage(error)}`);
+        this.addFailure(stats, path, error);
       }
     }
   }
@@ -151,7 +206,10 @@ export class SyncEngine {
     settings: FeishuSyncSettings,
     stats: SyncStats
   ): Promise<void> {
-    const paths = new Set([...localFiles.keys(), ...tree.files.keys()]);
+    const disabled = new Set(this.state.disabledPaths.map(normalizeVaultPath));
+    const paths = new Set(
+      [...localFiles.keys(), ...tree.files.keys()].filter((path) => !disabled.has(path))
+    );
     for (const path of [...paths].sort()) {
       const local = localFiles.get(path);
       const remote = tree.files.get(path);
@@ -171,6 +229,7 @@ export class SyncEngine {
           } else {
             this.state.entries[path] = this.makeEntry(local, hash, remote, entry?.emptyPlaceholder);
             stats.skipped += 1;
+            this.markSuccess(stats, path);
           }
           continue;
         }
@@ -183,6 +242,7 @@ export class SyncEngine {
             await this.vault.trash(local.file, false);
             delete this.state.entries[path];
             stats.deletedLocal += 1;
+            this.markSuccess(stats, path);
           } else {
             await this.uploadLocal(path, local, data, hash, undefined, tree, stats);
           }
@@ -197,12 +257,13 @@ export class SyncEngine {
             tree.files.delete(path);
             delete this.state.entries[path];
             stats.deletedRemote += 1;
+            this.markSuccess(stats, path);
           } else {
             await this.pullRemote(path, remote, entry, stats);
           }
         }
       } catch (error) {
-        stats.errors.push(`${path}: ${this.errorMessage(error)}`);
+        this.addFailure(stats, path, error);
       }
     }
   }
@@ -234,6 +295,7 @@ export class SyncEngine {
     tree.files.set(path, remoteNode);
     this.state.entries[path] = this.makeEntry(local, hash, remoteNode, uploaded.emptyPlaceholder);
     stats.uploaded += 1;
+    this.markSuccess(stats, path);
   }
 
   private async pullRemote(
@@ -249,6 +311,7 @@ export class SyncEngine {
     const hash = await sha256(data);
     this.state.entries[path] = this.makeEntry({ file, data, hash }, hash, remote, emptyPlaceholder);
     stats.downloaded += 1;
+    this.markSuccess(stats, path);
   }
 
   private async preserveRemoteConflict(
@@ -355,6 +418,46 @@ export class SyncEngine {
       if (!this.vault.getAbstractFileByPath(candidate)) return candidate;
     }
     throw new Error(`无法为 ${path} 创建唯一的冲突副本`);
+  }
+
+  private createStats(): SyncStats {
+    return {
+      uploaded: 0,
+      downloaded: 0,
+      deletedRemote: 0,
+      deletedLocal: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: [],
+      successfulPaths: [],
+      failures: [],
+      startedAt: Date.now(),
+      finishedAt: 0
+    };
+  }
+
+  private async finish(stats: SyncStats): Promise<void> {
+    stats.finishedAt = Date.now();
+    this.state.lastSyncAt = stats.finishedAt;
+    for (const path of stats.successfulPaths) delete this.state.fileFailures[path];
+    for (const failure of stats.failures) this.state.fileFailures[failure.path] = failure.message;
+    this.state.lastRun = {
+      startedAt: stats.startedAt,
+      finishedAt: stats.finishedAt,
+      successfulPaths: [...new Set(stats.successfulPaths)].sort(),
+      failures: stats.failures
+    };
+    await this.persist();
+  }
+
+  private markSuccess(stats: SyncStats, path: string): void {
+    stats.successfulPaths.push(path);
+  }
+
+  private addFailure(stats: SyncStats, path: string, error: unknown): void {
+    const message = typeof error === "string" ? error : this.errorMessage(error);
+    stats.errors.push(`${path}: ${message}`);
+    stats.failures.push({ path, message });
   }
 
   private errorMessage(error: unknown): string {
