@@ -78,20 +78,21 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       }
     });
     this.addCommand({
+      id: "save-and-sync-active-file",
+      name: "保存并立即同步当前文件",
+      hotkeys: [{ modifiers: ["Mod"], key: "s" }],
+      checkCallback: (checking) => {
+        if (!this.settings.syncOnSave) return false;
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view?.file || view.getMode() !== "source") return false;
+        if (!checking) void this.saveAndSyncView(view);
+        return true;
+      }
+    });
+    this.addCommand({
       id: "test-connection",
       name: "测试飞书连接",
       callback: () => void this.testConnection()
-    });
-    this.registerDomEvent(document, "keydown", (event: KeyboardEvent) => {
-      if (!this.settings.syncOnSave || event.repeat) return;
-      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
-      if (event.key.toLocaleLowerCase() !== "s") return;
-      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (!view?.file || !view.editor.hasFocus()) return;
-      const path = view.file.path;
-      void view.save()
-        .then(() => this.scheduleSaveSync(path))
-        .catch((error: unknown) => console.error("Feishu Vault Sync: failed to save before sync", error));
     });
     this.addSettingTab(new FeishuVaultSyncSettingTab(this.app, this));
     this.reschedule();
@@ -124,6 +125,18 @@ export default class FeishuVaultSyncPlugin extends Plugin {
 
   openSyncManager(): void {
     new FileSyncManagerModal(this.app, this).open();
+  }
+
+  private async saveAndSyncView(view: MarkdownView): Promise<void> {
+    const file = view.file;
+    if (!file) return;
+    try {
+      await view.save();
+      this.scheduleSaveSync(file.path);
+    } catch (error) {
+      console.error("Feishu Vault Sync: failed to save before sync", error);
+      new Notice(`保存当前文件失败：${error instanceof Error ? error.message : String(error)}`, 8000);
+    }
   }
 
   private scheduleSaveSync(path: string): void {
