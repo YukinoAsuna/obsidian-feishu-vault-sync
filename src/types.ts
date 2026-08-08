@@ -5,6 +5,8 @@ export interface FeishuSyncSettings {
   appId: string;
   appSecret: string;
   rootFolderToken: string;
+  remoteFolderPath: string;
+  localVaultPath: string;
   userOpenId: string;
   connectedAt: number;
   direction: SyncDirection;
@@ -88,6 +90,8 @@ export const DEFAULT_SETTINGS: FeishuSyncSettings = {
   appId: "",
   appSecret: "",
   rootFolderToken: "",
+  remoteFolderPath: "",
+  localVaultPath: "",
   userOpenId: "",
   connectedAt: 0,
   direction: "push",

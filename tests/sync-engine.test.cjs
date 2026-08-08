@@ -118,6 +118,8 @@ function settings(direction = "push") {
     appId: "app",
     appSecret: "secret",
     rootFolderToken: "root",
+    remoteFolderPath: "Obsidian Vault - Test",
+    localVaultPath: "C:/Vaults/Test",
     userOpenId: "user",
     connectedAt: 1,
     direction,
@@ -204,6 +206,7 @@ async function run() {
   });
   global.window = { setTimeout: (callback) => setTimeout(callback, 0) };
   const feishuCalls = [];
+  let createdFolderCount = 0;
   global.__feishuRequestUrl = async (params) => {
     feishuCalls.push(params);
     const success = (data) => ({
@@ -216,6 +219,17 @@ async function run() {
     if (params.url.endsWith("/auth/v3/tenant_access_token/internal")) {
       return { ...success({}), json: { code: 0, msg: "success", tenant_access_token: "tenant", expire: 7200 } };
     }
+    if (params.url.endsWith("/drive/explorer/v2/root_folder/meta")) {
+      return success({ token: "app-root" });
+    }
+    if (params.url.includes("/drive/v1/files?") && params.method === "GET") {
+      return success({ files: [], has_more: false });
+    }
+    if (params.url.endsWith("/drive/v1/files/create_folder")) {
+      createdFolderCount += 1;
+      return success({ token: `folder-${createdFolderCount}` });
+    }
+    if (params.url.includes("/permissions/") && params.method === "POST") return success({});
     if (params.url.endsWith("/docx/v1/documents/blocks/convert")) {
       return success({
         first_level_block_ids: ["temp-image"],
@@ -239,6 +253,10 @@ async function run() {
   const apiSettings = settings();
   apiSettings.markdownMode = "docx";
   const feishuClient = new FeishuClient(() => apiSettings);
+  assert.notEqual(
+    feishuClient.vaultStoragePath("Notes", "C:/Vaults/Notes"),
+    feishuClient.vaultStoragePath("Notes", "D:/Vaults/Notes")
+  );
   const updatedDoc = await feishuClient.upsertMarkdownDocument("Note", "root", {
     content: "![image](https://obsidian.local/assets%2Fimage.png)",
     images: new Map([["https://obsidian.local/assets%2Fimage.png", {
@@ -252,6 +270,19 @@ async function run() {
   assert.ok(feishuCalls.some((call) => call.url.endsWith("/children/batch_delete")));
   assert.ok(feishuCalls.some((call) => call.url.endsWith("/drive/v1/medias/upload_all")));
   assert.ok(feishuCalls.some((call) => call.url.endsWith("/blocks/real-image") && call.method === "PATCH"));
+
+  const storage = await feishuClient.setupStorage("Obsidian Vaults/personal database", "user");
+  assert.equal(storage.path, "Obsidian Vaults/personal database");
+  assert.equal(storage.token, "folder-2");
+  assert.equal(createdFolderCount, 2);
+  const createdFolderNames = feishuCalls
+    .filter((call) => call.url.endsWith("/drive/v1/files/create_folder"))
+    .map((call) => JSON.parse(call.body).name);
+  assert.deepEqual(createdFolderNames, ["Obsidian Vaults", "personal database"]);
+  await assert.rejects(
+    () => feishuClient.setupStorage("Obsidian Vaults/../unsafe", "user"),
+    /不能包含/
+  );
 
   const note = new TFile("note.md", "hello");
   const vault = new MockVault([note]);

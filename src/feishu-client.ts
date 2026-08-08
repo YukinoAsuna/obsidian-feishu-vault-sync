@@ -87,6 +87,7 @@ interface RootFolderResponse {
 
 export interface StorageSetupResult {
   token: string;
+  path: string;
   shareWarning?: string;
 }
 
@@ -118,17 +119,40 @@ export class FeishuClient {
     if (settings.markdownMode === "docx") await this.convertMarkdown("在线文档权限测试");
   }
 
-  async setupStorage(vaultName: string, userOpenId: string): Promise<StorageSetupResult> {
+  defaultStoragePath(vaultName: string): string {
+    const cleaned = vaultName.replace(/[\\/:*?"<>|\r\n]/g, "_").trim();
+    return `Obsidian Vault - ${cleaned || "Vault"}`.slice(0, 240);
+  }
+
+  vaultStoragePath(vaultName: string, localVaultPath: string): string {
+    const cleaned = vaultName.replace(/[\\/:*?"<>|\r\n]/g, "_").trim() || "Vault";
+    const normalizedPath = localVaultPath.replace(/\\/g, "/").replace(/\/+$/g, "").toLocaleLowerCase();
+    let hash = 2166136261;
+    for (let index = 0; index < normalizedPath.length; index += 1) {
+      hash ^= normalizedPath.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    const fingerprint = (hash >>> 0).toString(16).padStart(8, "0");
+    return `Obsidian Vaults/${`${cleaned} (${fingerprint})`.slice(0, 240)}`;
+  }
+
+  async setupStorage(remoteFolderPath: string, userOpenId: string): Promise<StorageSetupResult> {
     const root = await this.requestJson<RootFolderResponse>({
       url: `${API_BASE}/drive/explorer/v2/root_folder/meta`,
       method: "GET"
     });
     if (!root.token) throw new Error("飞书没有返回应用云盘根目录");
 
-    const folderName = this.storageFolderName(vaultName);
-    const rootChildren = await this.listFolder(root.token);
-    let folder = rootChildren.find((item) => item.type === "folder" && item.name === folderName);
-    if (!folder) folder = await this.createFolder(folderName, root.token);
+    const segments = this.storagePathSegments(remoteFolderPath);
+    let parentToken = root.token;
+    let folder: RemoteNode | undefined;
+    for (const segment of segments) {
+      const children = await this.listFolder(parentToken);
+      folder = children.find((item) => item.type === "folder" && item.name === segment);
+      if (!folder) folder = await this.createFolder(segment, parentToken);
+      parentToken = folder.token;
+    }
+    if (!folder) throw new Error("飞书同步目录路径不能为空");
 
     let shareWarning: string | undefined;
     if (userOpenId) {
@@ -141,7 +165,7 @@ export class FeishuClient {
     } else {
       shareWarning = "飞书未返回扫码用户的 Open ID，专用同步目录可能不会显示在你的云盘中";
     }
-    return { token: folder.token, shareWarning };
+    return { token: folder.token, path: segments.join("/"), shareWarning };
   }
 
   async listTree(rootFolderToken: string): Promise<RemoteTree> {
@@ -727,9 +751,24 @@ export class FeishuClient {
     });
   }
 
-  private storageFolderName(vaultName: string): string {
-    const cleaned = vaultName.replace(/[\\/:*?"<>|\r\n]/g, "_").trim();
-    return `Obsidian Vault - ${cleaned || "Vault"}`.slice(0, 240);
+  private storagePathSegments(path: string): string[] {
+    const segments = path
+      .replace(/\\/g, "/")
+      .split("/")
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+    if (segments.length === 0) throw new Error("飞书同步目录路径不能为空");
+    if (segments.length > 12) throw new Error("飞书同步目录最多支持 12 层");
+    for (const segment of segments) {
+      if (segment === "." || segment === "..") {
+        throw new Error("飞书同步目录不能包含 . 或 .. 路径段");
+      }
+      if (/[\\:*?"<>|\r\n]/.test(segment)) {
+        throw new Error(`飞书同步目录名称包含非法字符：${segment}`);
+      }
+      if (segment.length > 240) throw new Error(`飞书同步目录名称过长：${segment.slice(0, 30)}…`);
+    }
+    return segments;
   }
 
   private async listFolder(folderToken: string): Promise<RemoteNode[]> {
