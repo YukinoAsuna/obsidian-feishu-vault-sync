@@ -43,6 +43,10 @@
   gap: 0.5rem;
 }
 
+.feishu-vault-sync-folder-path {
+  min-width: min(28rem, 45vw);
+}
+
 .feishu-vault-sync-panel-description {
   color: var(--text-muted);
   margin-top: -0.35rem;

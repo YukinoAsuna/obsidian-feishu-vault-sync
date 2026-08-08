@@ -1,5 +1,6 @@
 import { TFile, TFolder, Vault } from "obsidian";
 import { FeishuClient } from "./feishu-client";
+import { LocalImageAsset, PreparedMarkdown, prepareMarkdownForDocx } from "./markdown-docx";
 import {
   FeishuSyncSettings,
   RemoteNode,
@@ -31,7 +32,8 @@ export class SyncEngine {
     private readonly getSettings: () => FeishuSyncSettings,
     private readonly state: SyncState,
     private readonly persist: () => Promise<void>,
-    private readonly onProgress: (message: string) => void
+    private readonly onProgress: (message: string) => void,
+    private readonly resolveLink?: (linkPath: string, sourcePath: string) => TFile | null
   ) {}
 
   async sync(): Promise<SyncStats> {
@@ -94,12 +96,7 @@ export class SyncEngine {
     for (const path of selected) {
       try {
         const remote = remoteTree.files.get(path);
-        if (remote) {
-          this.onProgress(`删除飞书文件：${path}`);
-          await this.client.deleteNode(remote.token, "file");
-          remoteTree.files.delete(path);
-          stats.deletedRemote += 1;
-        }
+        await this.deleteRemoteCopies(path, remote, remoteTree, stats);
         delete this.state.entries[path];
         disabled.add(path);
         this.markSuccess(stats, path);
@@ -189,10 +186,8 @@ export class SyncEngine {
       }
       try {
         this.onProgress(`删除飞书文件：${path}`);
-        await this.client.deleteNode(remote.token, "file");
-        tree.files.delete(path);
+        await this.deleteRemoteCopies(path, remote, tree, stats);
         delete this.state.entries[path];
-        stats.deletedRemote += 1;
         this.markSuccess(stats, path);
       } catch (error) {
         this.addFailure(stats, path, error);
@@ -253,10 +248,8 @@ export class SyncEngine {
           const remoteChanged = !entry || this.remoteChanged(entry, remote);
           if (entry && settings.propagateDeletions && !remoteChanged) {
             this.onProgress(`删除飞书文件：${path}`);
-            await this.client.deleteNode(remote.token, "file");
-            tree.files.delete(path);
+            await this.deleteRemoteCopies(path, remote, tree, stats);
             delete this.state.entries[path];
-            stats.deletedRemote += 1;
             this.markSuccess(stats, path);
           } else {
             await this.pullRemote(path, remote, entry, stats);
@@ -279,19 +272,33 @@ export class SyncEngine {
   ): Promise<void> {
     this.onProgress(`上传：${path}`);
     const folderToken = await this.ensureRemoteFolder(parentPath(path), tree);
-    const uploaded = await this.client.replaceFile(
-      baseName(path),
-      folderToken,
-      data,
-      remote?.token
-    );
+    const markdownAsDocx = this.getSettings().markdownMode === "docx"
+      && path.toLowerCase().endsWith(".md");
+    const uploaded = markdownAsDocx
+      ? await this.client.upsertMarkdownDocument(
+        baseName(path).replace(/\.md$/i, ""),
+        folderToken,
+        await this.prepareMarkdown(path, data),
+        remote?.type === "docx" ? remote.token : undefined
+      )
+      : await this.client.replaceFile(
+        baseName(path),
+        folderToken,
+        data,
+        remote?.type === "file" ? remote.token : undefined
+      );
     const remoteNode: RemoteNode = {
-      name: baseName(path),
+      name: markdownAsDocx ? baseName(path).replace(/\.md$/i, "") : baseName(path),
       token: uploaded.token,
-      type: "file",
+      type: markdownAsDocx ? "docx" : "file",
       parentToken: folderToken,
       modifiedTime: uploaded.modifiedTime
     };
+    if (remote && remote.token !== remoteNode.token) {
+      const duplicates = tree.duplicates.get(path) ?? [];
+      if (!duplicates.some((item) => item.token === remote.token)) duplicates.push(remote);
+      tree.duplicates.set(path, duplicates);
+    }
     tree.files.set(path, remoteNode);
     this.state.entries[path] = this.makeEntry(local, hash, remoteNode, uploaded.emptyPlaceholder);
     stats.uploaded += 1;
@@ -306,7 +313,7 @@ export class SyncEngine {
   ): Promise<void> {
     this.onProgress(`下载：${path}`);
     const emptyPlaceholder = Boolean(entry?.emptyPlaceholder && entry.remoteToken === remote.token);
-    const data = await this.client.downloadFile(remote.token, emptyPlaceholder);
+    const data = await this.downloadRemote(path, remote, emptyPlaceholder);
     const file = await this.writeLocal(path, data);
     const hash = await sha256(data);
     this.state.entries[path] = this.makeEntry({ file, data, hash }, hash, remote, emptyPlaceholder);
@@ -320,14 +327,84 @@ export class SyncEngine {
     entry: SyncEntry | undefined,
     stats: SyncStats
   ): Promise<void> {
-    const data = await this.client.downloadFile(
-      remote.token,
+    const data = await this.downloadRemote(
+      path,
+      remote,
       Boolean(entry?.emptyPlaceholder && entry.remoteToken === remote.token)
     );
     const target = this.uniqueConflictPath(path);
     this.onProgress(`保存冲突副本：${target}`);
     await this.writeLocal(target, data);
     stats.conflicts += 1;
+  }
+
+  private async prepareMarkdown(
+    path: string,
+    data: ArrayBuffer
+  ): Promise<PreparedMarkdown> {
+    const markdown = new TextDecoder().decode(data);
+    return prepareMarkdownForDocx(markdown, path, async (linkPath, sourcePath) => {
+      const image = this.resolveLocalImage(linkPath, sourcePath);
+      if (!image) return undefined;
+      return {
+        path: image.path,
+        fileName: baseName(image.path),
+        data: await this.vault.readBinary(image)
+      } satisfies LocalImageAsset;
+    });
+  }
+
+  private resolveLocalImage(linkPath: string, sourcePath: string): TFile | undefined {
+    const resolved = this.resolveLink?.(linkPath, sourcePath);
+    if (resolved) return resolved;
+    const normalized = normalizeVaultPath(linkPath);
+    const candidates = [
+      normalizeVaultPath(joinPath(parentPath(sourcePath), normalized)),
+      normalized
+    ];
+    for (const candidate of candidates) {
+      const file = this.vault.getAbstractFileByPath(candidate);
+      if (file instanceof TFile) return file;
+    }
+    const name = baseName(normalized).toLocaleLowerCase();
+    return this.vault.getFiles().find((file) => baseName(file.path).toLocaleLowerCase() === name);
+  }
+
+  private async downloadRemote(
+    notePath: string,
+    remote: RemoteNode,
+    emptyPlaceholder: boolean
+  ): Promise<ArrayBuffer> {
+    if (remote.type !== "docx") return this.client.downloadFile(remote.token, emptyPlaceholder);
+    return this.client.downloadMarkdownDocument(remote.token, async (token, kind, suggestedName) => {
+      const media = await this.client.downloadMedia(token);
+      const folder = normalizeVaultPath(this.getSettings().docxAttachmentFolder) || "Feishu Attachments";
+      const rawName = media.fileName || suggestedName || `feishu-${token}`;
+      const safeName = rawName.replace(/[\\/:*?"<>|\r\n]/g, "_").trim() || `feishu-${token}`;
+      const target = joinPath(folder, `${token.slice(0, 8)}-${safeName}`);
+      await this.writeLocal(target, media.data);
+      return target;
+    });
+  }
+
+  private async deleteRemoteCopies(
+    path: string,
+    primary: RemoteNode | undefined,
+    tree: RemoteTree,
+    stats: SyncStats
+  ): Promise<void> {
+    const copies = [primary, ...(tree.duplicates.get(path) ?? [])]
+      .filter((node): node is RemoteNode => Boolean(node));
+    const seen = new Set<string>();
+    for (const remote of copies) {
+      if (seen.has(remote.token)) continue;
+      seen.add(remote.token);
+      this.onProgress(`删除飞书文件：${path}`);
+      await this.client.deleteNode(remote.token, remote.type);
+      stats.deletedRemote += 1;
+    }
+    tree.files.delete(path);
+    tree.duplicates.delete(path);
   }
 
   private async ensureRemoteFolder(path: string, tree: RemoteTree): Promise<string> {
@@ -391,6 +468,7 @@ export class SyncEngine {
   ): SyncEntry {
     return {
       remoteToken: remote.token,
+      remoteType: remote.type,
       remoteModifiedTime: remote.modifiedTime,
       localHash: hash,
       localMtime: local.file.stat.mtime,
@@ -401,6 +479,7 @@ export class SyncEngine {
 
   private remoteChanged(entry: SyncEntry, remote: RemoteNode): boolean {
     return entry.remoteToken !== remote.token
+      || Boolean(entry.remoteType && entry.remoteType !== remote.type)
       || remote.modifiedTime > entry.remoteModifiedTime + 1;
   }
 

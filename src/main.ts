@@ -1,5 +1,6 @@
 import {
   App,
+  Command,
   MarkdownView,
   Modal,
   Notice,
@@ -51,6 +52,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
     defaultHttpInstance.defaults.adapter = obsidianRequestAdapter;
     await this.loadPluginData();
     this.client = new FeishuClient(() => this.settings);
+    await this.ensureVaultBinding();
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("feishu-vault-sync-status-button");
     this.registerDomEvent(this.statusBarItem, "click", () => this.openSyncManager());
@@ -82,17 +84,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       name: "测试飞书连接",
       callback: () => void this.testConnection()
     });
-    this.registerDomEvent(document, "keydown", (event: KeyboardEvent) => {
-      if (!this.settings.syncOnSave || event.repeat) return;
-      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
-      if (event.key.toLocaleLowerCase() !== "s") return;
-      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (!view?.file || !view.editor.hasFocus()) return;
-      const path = view.file.path;
-      void view.save()
-        .then(() => this.scheduleSaveSync(path))
-        .catch((error: unknown) => console.error("Feishu Vault Sync: failed to save before sync", error));
-    });
+    this.hookCoreSaveCommand();
     this.addSettingTab(new FeishuVaultSyncSettingTab(this.app, this));
     this.reschedule();
 
@@ -113,17 +105,111 @@ export default class FeishuVaultSyncPlugin extends Plugin {
   async updateSettings(patch: Partial<FeishuSyncSettings>): Promise<void> {
     const previousInterval = this.settings.intervalMinutes;
     const previousAutoSyncEnabled = this.settings.autoSyncEnabled;
+    const previousMarkdownMode = this.settings.markdownMode;
     this.settings = { ...this.settings, ...patch };
     this.settings.intervalMinutes = Math.max(1, Math.min(10080, this.settings.intervalMinutes || 30));
     await this.persist();
+    if (this.settings.markdownMode !== previousMarkdownMode) {
+      for (const path of Object.keys(this.state.entries)) {
+        if (path.toLowerCase().endsWith(".md")) delete this.state.entries[path];
+      }
+      this.remoteFiles = undefined;
+      this.remoteStatusCheckedAt = 0;
+      await this.persist();
+    }
     if (
       this.settings.intervalMinutes !== previousInterval
       || this.settings.autoSyncEnabled !== previousAutoSyncEnabled
     ) this.reschedule();
   }
 
+  getCurrentVaultPath(): string {
+    const adapter = this.app.vault.adapter as { getBasePath?: () => string };
+    const basePath = adapter.getBasePath?.() || this.app.vault.getName();
+    return basePath.replace(/\\/g, "/").replace(/\/+$/g, "");
+  }
+
+  getDefaultRemoteFolderPath(): string {
+    return this.client.vaultStoragePath(this.app.vault.getName(), this.getCurrentVaultPath());
+  }
+
+  async changeRemoteFolderPath(remoteFolderPath: string): Promise<boolean> {
+    if (this.syncing) {
+      new Notice("同步正在运行，请完成后再切换飞书目录");
+      return false;
+    }
+    if (!this.settings.appId.trim() || !this.settings.appSecret.trim()) {
+      new Notice("请先扫码连接飞书，再设置当前仓库的飞书目录");
+      return false;
+    }
+
+    const notice = new Notice("正在创建或连接飞书同步目录…", 0);
+    try {
+      const storage = await this.client.setupStorage(remoteFolderPath, this.settings.userOpenId);
+      const bindingChanged = this.settings.rootFolderToken !== storage.token
+        || this.settings.remoteFolderPath !== storage.path
+        || !this.vaultPathsMatch(this.settings.localVaultPath, this.getCurrentVaultPath());
+      this.settings.rootFolderToken = storage.token;
+      this.settings.remoteFolderPath = storage.path;
+      this.settings.localVaultPath = this.getCurrentVaultPath();
+      if (bindingChanged) this.resetSyncState();
+      this.remoteFiles = undefined;
+      this.remoteStatusCheckedAt = 0;
+      await this.persist();
+      this.setStatus("飞书同步：已连接");
+      notice.setMessage(`已将当前仓库关联到飞书目录：${storage.path}`);
+      window.setTimeout(() => notice.hide(), 6000);
+      if (storage.shareWarning) new Notice(`目录已关联，但共享时出现提示：${storage.shareWarning}`, 10000);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      notice.setMessage(`切换飞书目录失败：${message}`);
+      window.setTimeout(() => notice.hide(), 10000);
+      return false;
+    }
+  }
+
   openSyncManager(): void {
     new FileSyncManagerModal(this.app, this).open();
+  }
+
+  private hookCoreSaveCommand(): void {
+    const commandManager = (this.app as App & {
+      commands?: { commands: Record<string, Command> };
+    }).commands;
+    const saveCommand = commandManager?.commands["editor:save-file"];
+    const originalCheckCallback = saveCommand?.checkCallback;
+    if (!saveCommand || !originalCheckCallback) {
+      console.warn("Feishu Vault Sync: Obsidian core save command is unavailable");
+      return;
+    }
+
+    const wrappedCheckCallback = (checking: boolean): boolean | void => {
+      const result = originalCheckCallback.call(saveCommand, checking);
+      if (!checking && result && this.settings.syncOnSave) {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view?.file && view.getMode() === "source") void this.saveAndSyncView(view);
+      }
+      return result;
+    };
+    saveCommand.checkCallback = wrappedCheckCallback;
+    this.register(() => {
+      if (saveCommand.checkCallback === wrappedCheckCallback) {
+        saveCommand.checkCallback = originalCheckCallback;
+      }
+    });
+  }
+
+  private async saveAndSyncView(view: MarkdownView): Promise<void> {
+    const file = view.file;
+    if (!file) return;
+    try {
+      await view.save();
+      this.scheduleSaveSync(file.path);
+    } catch (error) {
+      console.error("Feishu Vault Sync: failed to save before sync", error);
+      new Notice(`保存当前文件失败：${error instanceof Error ? error.message : String(error)}`, 8000);
+    }
   }
 
   private scheduleSaveSync(path: string): void {
@@ -293,6 +379,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
           statuses.push({ path, category: "pending", message: "飞书副本不存在" });
         } else if (remote && (
           entry.remoteToken !== remote.token
+          || Boolean(entry.remoteType && entry.remoteType !== remote.type)
           || remote.modifiedTime > entry.remoteModifiedTime + 1
         )) {
           statuses.push({ path, category: "pending", message: "飞书文件在上次同步后有变化" });
@@ -331,7 +418,9 @@ export default class FeishuVaultSyncPlugin extends Plugin {
     const notice = new Notice("正在测试飞书连接…", 0);
     try {
       await this.client.testConnection();
-      notice.setMessage("飞书连接成功，根文件夹可以访问");
+      notice.setMessage(this.settings.markdownMode === "docx"
+        ? "飞书连接成功，根文件夹和在线文档转换权限可以访问"
+        : "飞书连接成功，根文件夹可以访问");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       notice.setMessage(`飞书连接失败：${message}`);
@@ -345,6 +434,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       this.settings.appId
       && this.settings.appSecret
       && this.settings.rootFolderToken
+      && this.vaultPathsMatch(this.settings.localVaultPath, this.getCurrentVaultPath())
     );
   }
 
@@ -367,7 +457,7 @@ export default class FeishuVaultSyncPlugin extends Plugin {
         signal: abortController.signal,
         appPreset: {
           name: "Obsidian Vault Sync",
-          desc: "将 Obsidian Vault 按原始目录和文件格式同步到飞书云盘"
+          desc: "将 Obsidian Vault 按原始目录同步到飞书云盘，并可把 Markdown 转为在线文档"
         },
         addons: {
           preset: false,
@@ -375,6 +465,11 @@ export default class FeishuVaultSyncPlugin extends Plugin {
             tenant: [
               "drive:drive",
               "drive:drive.metadata:readonly",
+              "drive:drive:version",
+              "docx:document",
+              "docx:document.block:convert",
+              "docs:document.media:upload",
+              "docs:document.media:download",
             ]
           }
         },
@@ -399,26 +494,31 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       };
       await this.persist();
 
-      let storage: { token: string; shareWarning?: string };
+      let storage: { token: string; path: string; shareWarning?: string };
       if (previousAppId === this.settings.appId && previousRootToken) {
         try {
           await this.client.testConnection();
-          storage = { token: previousRootToken };
+          storage = {
+            token: previousRootToken,
+            path: this.settings.remoteFolderPath || this.getDefaultRemoteFolderPath()
+          };
         } catch {
           storage = await this.client.setupStorage(
-            this.app.vault.getName(),
+            this.settings.remoteFolderPath || this.getDefaultRemoteFolderPath(),
             this.settings.userOpenId
           );
         }
       } else {
         storage = await this.client.setupStorage(
-          this.app.vault.getName(),
+          this.settings.remoteFolderPath || this.getDefaultRemoteFolderPath(),
           this.settings.userOpenId
         );
       }
       this.settings.rootFolderToken = storage.token;
+      this.settings.remoteFolderPath = storage.path;
+      this.settings.localVaultPath = this.getCurrentVaultPath();
       if (previousAppId !== this.settings.appId || previousRootToken !== storage.token) {
-        this.state = { ...DEFAULT_STATE, entries: {}, disabledPaths: [], fileFailures: {} };
+        this.resetSyncState();
       }
       await this.persist();
       modal.finish("飞书连接成功，马上开始首次同步");
@@ -452,10 +552,85 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       userOpenId: "",
       connectedAt: 0
     };
-    this.state = { ...DEFAULT_STATE, entries: {}, disabledPaths: [], fileFailures: {} };
+    this.resetSyncState();
     await this.persist();
     this.setStatus("飞书同步：未连接");
     new Notice("已断开飞书连接；飞书云盘中的文件不会被删除");
+  }
+
+  private async ensureVaultBinding(): Promise<void> {
+    const currentVaultPath = this.getCurrentVaultPath();
+    const savedVaultPath = this.settings.localVaultPath.trim();
+    const legacyBinding = !savedVaultPath;
+    const copiedFromAnotherVault = Boolean(savedVaultPath)
+      && !this.vaultPathsMatch(savedVaultPath, currentVaultPath);
+    let changed = false;
+
+    if (!this.settings.remoteFolderPath.trim() || copiedFromAnotherVault) {
+      this.settings.remoteFolderPath = legacyBinding && this.settings.rootFolderToken
+        ? this.client.defaultStoragePath(this.app.vault.getName())
+        : this.getDefaultRemoteFolderPath();
+      changed = true;
+    }
+    if (legacyBinding || copiedFromAnotherVault) {
+      this.settings.localVaultPath = currentVaultPath;
+      changed = true;
+    }
+
+    if (!this.settings.appId.trim() || !this.settings.appSecret.trim()) {
+      if (changed) await this.persist();
+      return;
+    }
+    if (!legacyBinding && !copiedFromAnotherVault) {
+      if (changed) await this.persist();
+      return;
+    }
+
+    const previousRootToken = this.settings.rootFolderToken;
+    this.settings.rootFolderToken = "";
+    if (copiedFromAnotherVault) this.resetSyncState();
+    await this.persist();
+
+    try {
+      const storage = await this.client.setupStorage(
+        this.settings.remoteFolderPath,
+        this.settings.userOpenId
+      );
+      this.settings.rootFolderToken = storage.token;
+      this.settings.remoteFolderPath = storage.path;
+      const remoteDirectoryChanged = Boolean(previousRootToken)
+        && previousRootToken !== storage.token;
+      if (copiedFromAnotherVault || remoteDirectoryChanged) this.resetSyncState();
+      if (copiedFromAnotherVault || remoteDirectoryChanged) {
+        this.settings.autoSyncEnabled = false;
+        this.settings.syncOnStartup = false;
+        console.warn(
+          "Feishu Vault Sync: automatic sync paused after binding this vault to a different remote directory"
+        );
+      }
+      await this.persist();
+      if (storage.shareWarning) {
+        console.warn("Feishu Vault Sync: vault directory share warning", storage.shareWarning);
+      }
+    } catch (error) {
+      console.error("Feishu Vault Sync: could not establish the vault-specific directory", error);
+      // Keep rootFolderToken empty. This deliberately blocks startup and scheduled
+      // sync until this vault has a verified, vault-specific remote directory.
+      await this.persist();
+    }
+  }
+
+  private vaultPathsMatch(left: string, right: string): boolean {
+    const normalize = (value: string) => value
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/\/+$/g, "")
+      .toLocaleLowerCase();
+    return Boolean(normalize(left)) && normalize(left) === normalize(right);
+  }
+
+  private resetSyncState(): void {
+    this.state = { ...DEFAULT_STATE, entries: {}, disabledPaths: [], fileFailures: {} };
   }
 
   private async loadPluginData(): Promise<void> {
@@ -487,7 +662,8 @@ export default class FeishuVaultSyncPlugin extends Plugin {
       () => this.settings,
       this.state,
       () => this.persist(),
-      (message) => this.setStatus(`飞书同步：${message}`)
+      (message) => this.setStatus(`飞书同步：${message}`),
+      (linkPath, sourcePath) => this.app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath)
     );
   }
 
@@ -533,7 +709,9 @@ class FeishuVaultSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "飞书云盘同步" });
     containerEl.createEl("p", {
-      text: "插件会把笔记和附件作为原始文件同步到飞书，以无损保留 Obsidian 的 Markdown、YAML、双链和目录结构。"
+      text: this.plugin.settings.markdownMode === "docx"
+        ? "Markdown 笔记会同步为可编辑的飞书在线文档并保留历史版本；其他附件仍按原始文件同步，目录结构保持不变。"
+        : "插件会把笔记和附件作为原始文件同步到飞书，以无损保留 Obsidian 的 Markdown、YAML、双链和目录结构。"
     });
 
     const connectedAt = this.plugin.settings.connectedAt
@@ -561,6 +739,72 @@ class FeishuVaultSyncSettingTab extends PluginSettingTab {
           await this.plugin.disconnectFeishu();
           this.display();
         }));
+    }
+
+    let remoteFolderPath = this.plugin.settings.remoteFolderPath
+      || this.plugin.getDefaultRemoteFolderPath();
+    new Setting(containerEl)
+      .setName("当前仓库关联的飞书目录")
+      .setDesc(`本地仓库：${this.plugin.getCurrentVaultPath()}。可填写单层目录名或用 / 分隔的路径；切换目录会为当前仓库重新建立独立同步状态。`)
+      .addText((text) => {
+        text.inputEl.addClass("feishu-vault-sync-folder-path");
+        text
+          .setPlaceholder("Obsidian Vaults/当前仓库")
+          .setValue(remoteFolderPath)
+          .onChange((value) => {
+            remoteFolderPath = value;
+          });
+      })
+      .addButton((button) => button
+        .setButtonText("应用目录")
+        .setCta()
+        .onClick(async () => {
+          if (await this.plugin.changeRemoteFolderPath(remoteFolderPath)) this.display();
+        }));
+
+    const markdownModeSetting = new Setting(containerEl)
+      .setName("Markdown 在飞书中的格式")
+      .setDesc(this.plugin.settings.markdownMode === "docx"
+        ? "在线文档模式：原地更新同一文档、支持飞书历史记录和图片素材双向同步。首次启用后请重新扫码授权"
+        : "原始文件模式：继续把 .md 作为普通云盘文件上传");
+    markdownModeSetting.addDropdown((dropdown) => dropdown
+      .addOption("file", "普通 .md 文件（兼容模式）")
+      .addOption("docx", "飞书在线文档（保留历史）")
+      .setValue(this.plugin.settings.markdownMode)
+      .onChange(async (value) => {
+        await this.plugin.updateSettings({
+          markdownMode: value as FeishuSyncSettings["markdownMode"]
+        });
+        if (value === "docx") {
+          new Notice("已启用在线文档模式。请点击“重新扫码授权”批准文档和图片权限，然后执行全量同步", 10000);
+        }
+        this.display();
+      }));
+    if (this.plugin.settings.markdownMode === "docx") {
+      markdownModeSetting.addButton((button) => button
+        .setCta()
+        .setButtonText("迁移/同步全部笔记")
+        .onClick(async () => {
+          await this.plugin.runSync("在线文档迁移");
+          this.display();
+        }));
+
+      new Setting(containerEl)
+        .setName("同步前创建飞书历史版本")
+        .setDesc("默认开启；更新已有在线文档前创建一个带时间的可恢复版本")
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.createDocxVersions)
+          .onChange(async (value) => this.plugin.updateSettings({ createDocxVersions: value })));
+
+      new Setting(containerEl)
+        .setName("飞书图片写回目录")
+        .setDesc("从飞书在线文档写回的图片和附件保存在 Vault 的这个目录中")
+        .addText((text) => text
+          .setPlaceholder("Feishu Attachments")
+          .setValue(this.plugin.settings.docxAttachmentFolder)
+          .onChange(async (value) => this.plugin.updateSettings({
+            docxAttachmentFolder: normalizeVaultPath(value) || "Feishu Attachments"
+          })));
     }
 
     new Setting(containerEl)

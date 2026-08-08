@@ -1,6 +1,13 @@
 import { requestUrl, RequestUrlParam } from "obsidian";
+import {
+  DocxBlock,
+  LocalImageAsset,
+  PreparedMarkdown,
+  SaveDocxMedia,
+  documentBlocksToMarkdown
+} from "./markdown-docx";
 import { FeishuSyncSettings, RemoteNode, RemoteTree } from "./types";
-import { joinPath, toArrayBuffer } from "./utils";
+import { joinPath, normalizeVaultPath, toArrayBuffer } from "./utils";
 
 const API_BASE = "https://open.feishu.cn/open-apis";
 const SIMPLE_UPLOAD_LIMIT = 20 * 1024 * 1024;
@@ -35,6 +42,35 @@ interface UploadResponse {
   file_token: string;
 }
 
+interface CreateDocumentResponse {
+  document?: {
+    document_id?: string;
+    revision_id?: number;
+    title?: string;
+  };
+}
+
+interface ConvertDocumentResponse {
+  first_level_block_ids?: string[];
+  blocks?: DocxBlock[];
+  block_id_to_image_urls?: Array<{ block_id: string; image_url: string }>;
+}
+
+interface CreateDescendantResponse {
+  document_revision_id?: number;
+  block_id_relations?: Array<{ temporary_block_id?: string; block_id?: string }>;
+}
+
+interface DocumentBlockListResponse {
+  items?: DocxBlock[];
+  has_more?: boolean;
+  page_token?: string;
+}
+
+interface DocumentVersionResponse {
+  version?: string;
+}
+
 interface PrepareUploadResponse {
   upload_id: string;
   block_size: number;
@@ -51,6 +87,7 @@ interface RootFolderResponse {
 
 export interface StorageSetupResult {
   token: string;
+  path: string;
   shareWarning?: string;
 }
 
@@ -58,6 +95,12 @@ export interface UploadedFile {
   token: string;
   modifiedTime: number;
   emptyPlaceholder: boolean;
+}
+
+export interface DownloadedMedia {
+  data: ArrayBuffer;
+  fileName: string;
+  contentType: string;
 }
 
 export class FeishuClient {
@@ -73,19 +116,43 @@ export class FeishuClient {
     this.validateCredentials(settings);
     if (!settings.rootFolderToken.trim()) throw new Error("尚未创建飞书同步目录，请重新扫码连接");
     await this.listFolder(settings.rootFolderToken.trim());
+    if (settings.markdownMode === "docx") await this.convertMarkdown("在线文档权限测试");
   }
 
-  async setupStorage(vaultName: string, userOpenId: string): Promise<StorageSetupResult> {
+  defaultStoragePath(vaultName: string): string {
+    const cleaned = vaultName.replace(/[\\/:*?"<>|\r\n]/g, "_").trim();
+    return `Obsidian Vault - ${cleaned || "Vault"}`.slice(0, 240);
+  }
+
+  vaultStoragePath(vaultName: string, localVaultPath: string): string {
+    const cleaned = vaultName.replace(/[\\/:*?"<>|\r\n]/g, "_").trim() || "Vault";
+    const normalizedPath = localVaultPath.replace(/\\/g, "/").replace(/\/+$/g, "").toLocaleLowerCase();
+    let hash = 2166136261;
+    for (let index = 0; index < normalizedPath.length; index += 1) {
+      hash ^= normalizedPath.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    const fingerprint = (hash >>> 0).toString(16).padStart(8, "0");
+    return `Obsidian Vaults/${`${cleaned} (${fingerprint})`.slice(0, 240)}`;
+  }
+
+  async setupStorage(remoteFolderPath: string, userOpenId: string): Promise<StorageSetupResult> {
     const root = await this.requestJson<RootFolderResponse>({
       url: `${API_BASE}/drive/explorer/v2/root_folder/meta`,
       method: "GET"
     });
     if (!root.token) throw new Error("飞书没有返回应用云盘根目录");
 
-    const folderName = this.storageFolderName(vaultName);
-    const rootChildren = await this.listFolder(root.token);
-    let folder = rootChildren.find((item) => item.type === "folder" && item.name === folderName);
-    if (!folder) folder = await this.createFolder(folderName, root.token);
+    const segments = this.storagePathSegments(remoteFolderPath);
+    let parentToken = root.token;
+    let folder: RemoteNode | undefined;
+    for (const segment of segments) {
+      const children = await this.listFolder(parentToken);
+      folder = children.find((item) => item.type === "folder" && item.name === segment);
+      if (!folder) folder = await this.createFolder(segment, parentToken);
+      parentToken = folder.token;
+    }
+    if (!folder) throw new Error("飞书同步目录路径不能为空");
 
     let shareWarning: string | undefined;
     if (userOpenId) {
@@ -98,13 +165,14 @@ export class FeishuClient {
     } else {
       shareWarning = "飞书未返回扫码用户的 Open ID，专用同步目录可能不会显示在你的云盘中";
     }
-    return { token: folder.token, shareWarning };
+    return { token: folder.token, path: segments.join("/"), shareWarning };
   }
 
   async listTree(rootFolderToken: string): Promise<RemoteTree> {
     const tree: RemoteTree = {
       folders: new Map<string, RemoteNode>(),
       files: new Map<string, RemoteNode>(),
+      duplicates: new Map<string, RemoteNode[]>(),
       unsupported: new Map<string, RemoteNode>()
     };
     tree.folders.set("", {
@@ -126,14 +194,26 @@ export class FeishuClient {
       }
       const children = await this.listFolder(current.token);
       for (const child of children) {
-        const path = joinPath(current.path, child.name);
+        const path = joinPath(
+          current.path,
+          child.type === "docx" && this.getSettings().markdownMode === "docx"
+            ? this.localMarkdownName(child.name)
+            : child.name
+        );
         if (child.type === "folder") {
           tree.folders.set(path, child);
           queue.push({ path, token: child.token, depth: current.depth + 1 });
-        } else if (child.type === "file") {
+        } else if (child.type === "file" || (
+          child.type === "docx" && this.getSettings().markdownMode === "docx"
+        )) {
           const previous = tree.files.get(path);
-          if (!previous || previous.modifiedTime <= child.modifiedTime) {
+          if (!previous) {
             tree.files.set(path, child);
+          } else if (this.preferRemoteNode(path, child, previous)) {
+            this.addDuplicate(tree, path, previous);
+            tree.files.set(path, child);
+          } else {
+            this.addDuplicate(tree, path, child);
           }
         } else {
           tree.unsupported.set(path, child);
@@ -141,6 +221,25 @@ export class FeishuClient {
       }
     }
     return tree;
+  }
+
+  private localMarkdownName(title: string): string {
+    return title.toLowerCase().endsWith(".md") ? title : `${title}.md`;
+  }
+
+  private preferRemoteNode(path: string, candidate: RemoteNode, current: RemoteNode): boolean {
+    const markdown = path.toLowerCase().endsWith(".md");
+    if (this.getSettings().markdownMode === "docx" && markdown) {
+      if (candidate.type === "docx" && current.type !== "docx") return true;
+      if (candidate.type !== "docx" && current.type === "docx") return false;
+    }
+    return candidate.modifiedTime >= current.modifiedTime;
+  }
+
+  private addDuplicate(tree: RemoteTree, path: string, node: RemoteNode): void {
+    const duplicates = tree.duplicates.get(path) ?? [];
+    if (!duplicates.some((item) => item.token === node.token)) duplicates.push(node);
+    tree.duplicates.set(path, duplicates);
   }
 
   async createFolder(name: string, parentToken: string): Promise<RemoteNode> {
@@ -256,6 +355,363 @@ export class FeishuClient {
     return uploaded;
   }
 
+  async upsertMarkdownDocument(
+    title: string,
+    parentToken: string,
+    prepared: PreparedMarkdown,
+    previousToken?: string
+  ): Promise<UploadedFile> {
+    const converted = await this.convertMarkdown(prepared.content);
+    const imageSources = new Map<string, { fileName: string; data: ArrayBuffer }>();
+    for (const image of converted.block_id_to_image_urls ?? []) {
+      if (!image.image_url || imageSources.has(image.image_url)) continue;
+      imageSources.set(image.image_url, await this.loadImageSource(image.image_url, prepared.images));
+    }
+
+    let documentId = previousToken;
+    if (!documentId) {
+      const created = await this.createDocument(title, parentToken);
+      documentId = created.documentId;
+    } else if (this.getSettings().createDocxVersions) {
+      await this.createDocumentVersion(documentId);
+    }
+
+    const existingBlocks = await this.listDocumentBlocks(documentId);
+    const root = existingBlocks.find((block) => block.block_id === documentId || block.page);
+    const rootChildren = root?.children ?? [];
+    if (rootChildren.length > 0) await this.deleteDocumentChildren(documentId, rootChildren.length);
+
+    const blocks = (converted.blocks ?? []).map((block) => this.sanitizeConvertedBlock(block));
+    const batches = this.splitConvertedBlocks(converted.first_level_block_ids ?? [], blocks);
+    const idRelations = new Map<string, string>();
+    for (const batch of batches) {
+      const created = await this.createDocumentDescendants(
+        documentId,
+        batch.firstLevelIds,
+        batch.blocks
+      );
+      for (const relation of created.block_id_relations ?? []) {
+        if (relation.temporary_block_id && relation.block_id) {
+          idRelations.set(relation.temporary_block_id, relation.block_id);
+        }
+      }
+    }
+
+    for (const image of converted.block_id_to_image_urls ?? []) {
+      const actualBlockId = idRelations.get(image.block_id);
+      const source = imageSources.get(image.image_url);
+      if (!actualBlockId || !source) {
+        throw new Error(`飞书没有返回图片块映射：${image.image_url}`);
+      }
+      const mediaToken = await this.uploadDocumentImage(
+        documentId,
+        actualBlockId,
+        source.fileName,
+        source.data
+      );
+      await this.replaceDocumentImage(documentId, actualBlockId, mediaToken);
+    }
+
+    return {
+      token: documentId,
+      modifiedTime: Math.floor(Date.now() / 1000),
+      emptyPlaceholder: false
+    };
+  }
+
+  async downloadMarkdownDocument(
+    documentId: string,
+    saveMedia: SaveDocxMedia
+  ): Promise<ArrayBuffer> {
+    const blocks = await this.listDocumentBlocks(documentId);
+    const markdown = await documentBlocksToMarkdown(blocks, documentId, saveMedia);
+    return new TextEncoder().encode(markdown).buffer;
+  }
+
+  async downloadMedia(token: string): Promise<DownloadedMedia> {
+    const accessToken = await this.getAccessToken();
+    const response = await requestUrl({
+      url: `${API_BASE}/drive/v1/medias/${encodeURIComponent(token)}/download`,
+      method: "GET",
+      headers: { Authorization: `Bearer ${accessToken}` },
+      throw: false
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`下载飞书文档素材失败（HTTP ${response.status}）`);
+    }
+    const contentType = this.headerValue(response.headers, "content-type") ?? "application/octet-stream";
+    const disposition = this.headerValue(response.headers, "content-disposition") ?? "";
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    const plainName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+    let fileName = encodedName ? decodeURIComponent(encodedName) : (plainName ?? "");
+    if (!fileName) fileName = `feishu-${token}${this.extensionForContentType(contentType)}`;
+    return { data: response.arrayBuffer, fileName, contentType };
+  }
+
+  private async convertMarkdown(content: string): Promise<ConvertDocumentResponse> {
+    return this.requestJson<ConvertDocumentResponse>({
+      url: `${API_BASE}/docx/v1/documents/blocks/convert`,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ content_type: "markdown", content })
+    });
+  }
+
+  private async createDocument(
+    title: string,
+    folderToken: string
+  ): Promise<{ documentId: string; revisionId: number }> {
+    await this.throttleMutation();
+    const data = await this.requestJson<CreateDocumentResponse>({
+      url: `${API_BASE}/docx/v1/documents`,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ title: title.slice(0, 800) || "未命名笔记", folder_token: folderToken })
+    });
+    const documentId = data.document?.document_id;
+    if (!documentId) throw new Error("飞书没有返回新建在线文档的 ID");
+    return { documentId, revisionId: data.document?.revision_id ?? 1 };
+  }
+
+  private async createDocumentVersion(documentId: string): Promise<void> {
+    await this.throttleMutation();
+    const timestamp = new Date().toLocaleString("zh-CN", { hour12: false });
+    await this.requestJson<DocumentVersionResponse>({
+      url: `${API_BASE}/drive/v1/files/${encodeURIComponent(documentId)}/versions`,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ name: `Obsidian 同步前 ${timestamp}`, obj_type: "docx" })
+    });
+  }
+
+  private async listDocumentBlocks(documentId: string): Promise<DocxBlock[]> {
+    const blocks: DocxBlock[] = [];
+    let pageToken = "";
+    do {
+      const query = new URLSearchParams({ page_size: "500", document_revision_id: "-1" });
+      if (pageToken) query.set("page_token", pageToken);
+      const data = await this.requestJson<DocumentBlockListResponse>({
+        url: `${API_BASE}/docx/v1/documents/${encodeURIComponent(documentId)}/blocks?${query.toString()}`,
+        method: "GET"
+      });
+      blocks.push(...(data.items ?? []));
+      pageToken = data.has_more ? (data.page_token ?? "") : "";
+    } while (pageToken);
+    return blocks;
+  }
+
+  private async deleteDocumentChildren(documentId: string, childCount: number): Promise<void> {
+    await this.throttleMutation();
+    await this.requestJson<Record<string, unknown>>({
+      url: `${API_BASE}/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(documentId)}/children/batch_delete`,
+      method: "DELETE",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ start_index: 0, end_index: childCount })
+    });
+  }
+
+  private async createDocumentDescendants(
+    documentId: string,
+    firstLevelIds: string[],
+    blocks: DocxBlock[]
+  ): Promise<CreateDescendantResponse> {
+    if (blocks.length === 0) return {};
+    await this.throttleMutation();
+    return this.requestJson<CreateDescendantResponse>({
+      url: `${API_BASE}/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(documentId)}/descendant`,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ index: -1, children_id: firstLevelIds, descendants: blocks })
+    });
+  }
+
+  private splitConvertedBlocks(
+    firstLevelIds: string[],
+    blocks: DocxBlock[]
+  ): Array<{ firstLevelIds: string[]; blocks: DocxBlock[] }> {
+    if (blocks.length === 0) return [];
+    const byId = new Map(blocks.flatMap((block) => block.block_id ? [[block.block_id, block] as const] : []));
+    const subtree = (rootId: string): Set<string> => {
+      const ids = new Set<string>();
+      const visit = (id: string): void => {
+        if (ids.has(id)) return;
+        ids.add(id);
+        for (const child of byId.get(id)?.children ?? []) visit(child);
+      };
+      visit(rootId);
+      return ids;
+    };
+    const groups: Array<{ roots: string[]; ids: Set<string> }> = [];
+    let current = { roots: [] as string[], ids: new Set<string>() };
+    for (const rootId of firstLevelIds) {
+      const ids = subtree(rootId);
+      if (ids.size > 1000) throw new Error(`单个 Markdown 内容树超过飞书单次 1000 块限制：${rootId}`);
+      if (current.ids.size > 0 && current.ids.size + ids.size > 1000) {
+        groups.push(current);
+        current = { roots: [], ids: new Set<string>() };
+      }
+      current.roots.push(rootId);
+      for (const id of ids) current.ids.add(id);
+    }
+    if (current.ids.size > 0) groups.push(current);
+    return groups.map((group) => ({
+      firstLevelIds: group.roots,
+      blocks: blocks.filter((block) => block.block_id && group.ids.has(block.block_id))
+    }));
+  }
+
+  private sanitizeConvertedBlock(block: DocxBlock): DocxBlock {
+    const sanitized = JSON.parse(JSON.stringify(block)) as DocxBlock;
+    delete sanitized.parent_id;
+    delete sanitized.comment_ids;
+    const table = sanitized.table as Record<string, unknown> | undefined;
+    if (table) {
+      delete table.merge_info;
+      const property = table.property as Record<string, unknown> | undefined;
+      if (property) delete property.merge_info;
+    }
+    return sanitized;
+  }
+
+  private async loadImageSource(
+    imageUrl: string,
+    localImages: Map<string, LocalImageAsset>
+  ): Promise<{ fileName: string; data: ArrayBuffer }> {
+    const local = localImages.get(imageUrl);
+    if (local) return { fileName: local.fileName, data: local.data };
+    try {
+      const parsed = new URL(imageUrl);
+      if (parsed.hostname === "obsidian.local") {
+        const path = normalizeVaultPath(decodeURIComponent(parsed.pathname.replace(/^\//, "")));
+        const matched = [...localImages.values()].find((asset) => normalizeVaultPath(asset.path) === path);
+        if (matched) return { fileName: matched.fileName, data: matched.data };
+      }
+    } catch { /* continue with other supported URL forms */ }
+    if (imageUrl.startsWith("data:")) {
+      const match = imageUrl.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+      if (!match) throw new Error("Markdown 中的 data 图片格式无效");
+      const decoded = match[2]
+        ? Uint8Array.from(atob(match[3]), (char) => char.charCodeAt(0))
+        : new TextEncoder().encode(decodeURIComponent(match[3]));
+      return { fileName: `embedded${this.extensionForContentType(match[1] ?? "image/png")}`, data: toArrayBuffer(decoded) };
+    }
+    if (!/^https?:\/\//i.test(imageUrl)) throw new Error(`不支持的图片地址：${imageUrl}`);
+    const response = await requestUrl({ url: imageUrl, method: "GET", throw: false });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`下载 Markdown 外链图片失败（HTTP ${response.status}）：${imageUrl}`);
+    }
+    const contentType = this.headerValue(response.headers, "content-type") ?? "image/png";
+    let fileName = "";
+    try { fileName = decodeURIComponent(new URL(imageUrl).pathname.split("/").pop() ?? ""); } catch { /* use fallback */ }
+    return {
+      fileName: fileName || `external${this.extensionForContentType(contentType)}`,
+      data: response.arrayBuffer
+    };
+  }
+
+  private async uploadDocumentImage(
+    documentId: string,
+    blockId: string,
+    fileName: string,
+    source: ArrayBuffer
+  ): Promise<string> {
+    const bytes = new Uint8Array(source);
+    const fields = {
+      file_name: fileName,
+      parent_type: "docx_image",
+      parent_node: blockId,
+      size: String(bytes.byteLength),
+      extra: JSON.stringify({ drive_route_token: documentId })
+    };
+    if (bytes.byteLength > SIMPLE_UPLOAD_LIMIT) {
+      return this.uploadMediaMultipart(fileName, bytes, fields);
+    }
+    await this.throttleMutation();
+    const boundary = `----ObsidianFeishuImage${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+    const body = this.buildMultipart(boundary, fields, fileName, bytes);
+    const data = await this.requestJson<UploadResponse>({
+      url: `${API_BASE}/drive/v1/medias/upload_all`,
+      method: "POST",
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body: toArrayBuffer(body)
+    });
+    return data.file_token;
+  }
+
+  private async uploadMediaMultipart(
+    fileName: string,
+    bytes: Uint8Array,
+    fields: Record<string, string>
+  ): Promise<string> {
+    await this.throttleMutation();
+    const prepared = await this.requestJson<PrepareUploadResponse>({
+      url: `${API_BASE}/drive/v1/medias/upload_prepare`,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ ...fields, size: bytes.byteLength })
+    });
+    if (!prepared.upload_id || prepared.block_size <= 0 || prepared.block_num <= 0) {
+      throw new Error(`飞书没有返回有效的图片分片策略：${fileName}`);
+    }
+    for (let sequence = 0; sequence < prepared.block_num; sequence += 1) {
+      const start = sequence * prepared.block_size;
+      const part = bytes.subarray(start, Math.min(bytes.byteLength, start + prepared.block_size));
+      await this.throttleMutation();
+      const boundary = `----ObsidianFeishuMedia${Date.now().toString(16)}${sequence}`;
+      const body = this.buildMultipart(boundary, {
+        upload_id: prepared.upload_id,
+        seq: String(sequence),
+        size: String(part.byteLength)
+      }, fileName, part);
+      await this.requestJson<Record<string, never>>({
+        url: `${API_BASE}/drive/v1/medias/upload_part`,
+        method: "POST",
+        headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+        body: toArrayBuffer(body)
+      });
+    }
+    await this.throttleMutation();
+    const finished = await this.requestJson<UploadResponse>({
+      url: `${API_BASE}/drive/v1/medias/upload_finish`,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ upload_id: prepared.upload_id, block_num: prepared.block_num })
+    });
+    return finished.file_token;
+  }
+
+  private async replaceDocumentImage(documentId: string, blockId: string, token: string): Promise<void> {
+    await this.throttleMutation();
+    await this.requestJson<Record<string, unknown>>({
+      url: `${API_BASE}/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(blockId)}`,
+      method: "PATCH",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ replace_image: { token } })
+    });
+  }
+
+  private extensionForContentType(contentType: string): string {
+    const clean = contentType.split(";", 1)[0].trim().toLowerCase();
+    const extensions: Record<string, string> = {
+      "image/jpeg": ".jpg",
+      "image/png": ".png",
+      "image/gif": ".gif",
+      "image/webp": ".webp",
+      "image/bmp": ".bmp",
+      "image/svg+xml": ".svg",
+      "application/pdf": ".pdf"
+    };
+    return extensions[clean] ?? "";
+  }
+
+  private headerValue(headers: Record<string, string>, name: string): string | undefined {
+    const target = name.toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === target) return value;
+    }
+    return undefined;
+  }
+
   async downloadFile(token: string, emptyPlaceholder = false): Promise<ArrayBuffer> {
     const accessToken = await this.getAccessToken();
     const response = await requestUrl({
@@ -295,9 +751,24 @@ export class FeishuClient {
     });
   }
 
-  private storageFolderName(vaultName: string): string {
-    const cleaned = vaultName.replace(/[\\/:*?"<>|\r\n]/g, "_").trim();
-    return `Obsidian Vault - ${cleaned || "Vault"}`.slice(0, 240);
+  private storagePathSegments(path: string): string[] {
+    const segments = path
+      .replace(/\\/g, "/")
+      .split("/")
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+    if (segments.length === 0) throw new Error("飞书同步目录路径不能为空");
+    if (segments.length > 12) throw new Error("飞书同步目录最多支持 12 层");
+    for (const segment of segments) {
+      if (segment === "." || segment === "..") {
+        throw new Error("飞书同步目录不能包含 . 或 .. 路径段");
+      }
+      if (/[\\:*?"<>|\r\n]/.test(segment)) {
+        throw new Error(`飞书同步目录名称包含非法字符：${segment}`);
+      }
+      if (segment.length > 240) throw new Error(`飞书同步目录名称过长：${segment.slice(0, 30)}…`);
+    }
+    return segments;
   }
 
   private async listFolder(folderToken: string): Promise<RemoteNode[]> {
@@ -417,8 +888,8 @@ export class FeishuClient {
 
   private async throttleMutation(): Promise<void> {
     const elapsed = Date.now() - this.lastMutationAt;
-    if (elapsed < 250) {
-      await new Promise((resolve) => window.setTimeout(resolve, 250 - elapsed));
+    if (elapsed < 350) {
+      await new Promise((resolve) => window.setTimeout(resolve, 350 - elapsed));
     }
     this.lastMutationAt = Date.now();
   }

@@ -25,6 +25,7 @@ Module._load = function load(request, parent, isMain) {
     return {
       TFile,
       TFolder,
+      requestUrl: (params) => global.__feishuRequestUrl(params),
       normalizePath: (value) => value.replace(/\\/g, "/").replace(/\/{2,}/g, "/")
     };
   }
@@ -75,6 +76,7 @@ class MockClient {
         modifiedTime: 0
       }]]),
       files: new Map(this.remoteFiles),
+      duplicates: new Map(),
       unsupported: new Map()
     };
   }
@@ -89,6 +91,12 @@ class MockClient {
       parentToken,
       modifiedTime: 2000
     });
+    return { token, modifiedTime: 2000, emptyPlaceholder: false };
+  }
+
+  async upsertMarkdownDocument(name, parentToken, prepared, previousToken) {
+    const token = previousToken || `docx-${this.uploaded.length + 1}`;
+    this.uploaded.push({ name, parentToken, prepared, previousToken, token, type: "docx" });
     return { token, modifiedTime: 2000, emptyPlaceholder: false };
   }
 
@@ -110,9 +118,14 @@ function settings(direction = "push") {
     appId: "app",
     appSecret: "secret",
     rootFolderToken: "root",
+    remoteFolderPath: "Obsidian Vault - Test",
+    localVaultPath: "C:/Vaults/Test",
     userOpenId: "user",
     connectedAt: 1,
     direction,
+    markdownMode: "file",
+    createDocxVersions: true,
+    docxAttachmentFolder: "Feishu Attachments",
     intervalMinutes: 30,
     autoSyncEnabled: true,
     syncOnSave: true,
@@ -124,7 +137,7 @@ function settings(direction = "push") {
 
 function state(disabledPaths = []) {
   return {
-    version: 2,
+    version: 3,
     lastSyncAt: 0,
     entries: {},
     disabledPaths,
@@ -145,6 +158,131 @@ async function run() {
     logLevel: "silent"
   });
   const { SyncEngine } = require(bundlePath);
+
+  const markdownBundlePath = path.join(tempDirectory, "markdown-docx.cjs");
+  esbuild.buildSync({
+    entryPoints: [path.join(__dirname, "..", "src", "markdown-docx.ts")],
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: ["obsidian"],
+    outfile: markdownBundlePath,
+    logLevel: "silent"
+  });
+  const { prepareMarkdownForDocx, documentBlocksToMarkdown } = require(markdownBundlePath);
+
+  const preparedMarkdown = await prepareMarkdownForDocx(
+    "# 图文\n\n![[assets/图片.png|600]]\n\n```md\n![[assets/图片.png]]\n```",
+    "notes/test.md",
+    async (linkPath) => linkPath === "assets/图片.png" ? {
+      path: "assets/图片.png",
+      fileName: "图片.png",
+      data: new Uint8Array([1, 2, 3]).buffer
+    } : undefined
+  );
+  assert.match(preparedMarkdown.content, /https:\/\/obsidian\.local\//);
+  assert.match(preparedMarkdown.content, /```md\n!\[\[assets\/图片\.png\]\]\n```/);
+  assert.equal(preparedMarkdown.images.size, 1);
+
+  const restoredMarkdown = await documentBlocksToMarkdown([
+    { block_id: "doc", block_type: 1, page: { elements: [] }, children: ["h", "b", "i"] },
+    { block_id: "h", parent_id: "doc", block_type: 3, heading1: { elements: [{ text_run: { content: "标题" } }] } },
+    { block_id: "b", parent_id: "doc", block_type: 12, bullet: { elements: [{ text_run: { content: "项目" } }] } },
+    { block_id: "i", parent_id: "doc", block_type: 27, image: { token: "media-token" } }
+  ], "doc", async () => "Feishu Attachments/media.png");
+  assert.match(restoredMarkdown, /^# 标题/m);
+  assert.match(restoredMarkdown, /^- 项目/m);
+  assert.match(restoredMarkdown, /!\[\[Feishu Attachments\/media\.png\]\]/);
+
+  const clientBundlePath = path.join(tempDirectory, "feishu-client.cjs");
+  esbuild.buildSync({
+    entryPoints: [path.join(__dirname, "..", "src", "feishu-client.ts")],
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: ["obsidian"],
+    outfile: clientBundlePath,
+    logLevel: "silent"
+  });
+  global.window = { setTimeout: (callback) => setTimeout(callback, 0) };
+  const feishuCalls = [];
+  let createdFolderCount = 0;
+  global.__feishuRequestUrl = async (params) => {
+    feishuCalls.push(params);
+    const success = (data) => ({
+      status: 200,
+      json: { code: 0, msg: "success", data },
+      text: JSON.stringify({ code: 0, msg: "success", data }),
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {}
+    });
+    if (params.url.endsWith("/auth/v3/tenant_access_token/internal")) {
+      return { ...success({}), json: { code: 0, msg: "success", tenant_access_token: "tenant", expire: 7200 } };
+    }
+    if (params.url.endsWith("/drive/explorer/v2/root_folder/meta")) {
+      return success({ token: "app-root" });
+    }
+    if (params.url.includes("/drive/v1/files?") && params.method === "GET") {
+      return success({ files: [], has_more: false });
+    }
+    if (params.url.endsWith("/drive/v1/files/create_folder")) {
+      createdFolderCount += 1;
+      return success({ token: `folder-${createdFolderCount}` });
+    }
+    if (params.url.includes("/permissions/") && params.method === "POST") return success({});
+    if (params.url.endsWith("/docx/v1/documents/blocks/convert")) {
+      return success({
+        first_level_block_ids: ["temp-image"],
+        blocks: [{ block_id: "temp-image", block_type: 27, image: {} }],
+        block_id_to_image_urls: [{ block_id: "temp-image", image_url: "https://obsidian.local/assets%2Fimage.png" }]
+      });
+    }
+    if (params.url.endsWith("/versions")) return success({ version: "v1" });
+    if (params.url.includes("/blocks?") && params.method === "GET") {
+      return success({ items: [{ block_id: "existing-doc", block_type: 1, page: { elements: [] }, children: ["old"] }] });
+    }
+    if (params.url.endsWith("/children/batch_delete")) return success({ document_revision_id: 2 });
+    if (params.url.endsWith("/descendant")) {
+      return success({ block_id_relations: [{ temporary_block_id: "temp-image", block_id: "real-image" }] });
+    }
+    if (params.url.endsWith("/drive/v1/medias/upload_all")) return success({ file_token: "media-token" });
+    if (params.url.endsWith("/blocks/real-image") && params.method === "PATCH") return success({});
+    throw new Error(`Unexpected Feishu request: ${params.method} ${params.url}`);
+  };
+  const { FeishuClient } = require(clientBundlePath);
+  const apiSettings = settings();
+  apiSettings.markdownMode = "docx";
+  const feishuClient = new FeishuClient(() => apiSettings);
+  assert.notEqual(
+    feishuClient.vaultStoragePath("Notes", "C:/Vaults/Notes"),
+    feishuClient.vaultStoragePath("Notes", "D:/Vaults/Notes")
+  );
+  const updatedDoc = await feishuClient.upsertMarkdownDocument("Note", "root", {
+    content: "![image](https://obsidian.local/assets%2Fimage.png)",
+    images: new Map([["https://obsidian.local/assets%2Fimage.png", {
+      path: "assets/image.png",
+      fileName: "image.png",
+      data: new Uint8Array([1, 2, 3]).buffer
+    }]])
+  }, "existing-doc");
+  assert.equal(updatedDoc.token, "existing-doc");
+  assert.ok(feishuCalls.some((call) => call.url.endsWith("/versions")));
+  assert.ok(feishuCalls.some((call) => call.url.endsWith("/children/batch_delete")));
+  assert.ok(feishuCalls.some((call) => call.url.endsWith("/drive/v1/medias/upload_all")));
+  assert.ok(feishuCalls.some((call) => call.url.endsWith("/blocks/real-image") && call.method === "PATCH"));
+
+  const storage = await feishuClient.setupStorage("Obsidian Vaults/personal database", "user");
+  assert.equal(storage.path, "Obsidian Vaults/personal database");
+  assert.equal(storage.token, "folder-2");
+  assert.equal(createdFolderCount, 2);
+  const createdFolderNames = feishuCalls
+    .filter((call) => call.url.endsWith("/drive/v1/files/create_folder"))
+    .map((call) => JSON.parse(call.body).name);
+  assert.deepEqual(createdFolderNames, ["Obsidian Vaults", "personal database"]);
+  await assert.rejects(
+    () => feishuClient.setupStorage("Obsidian Vaults/../unsafe", "user"),
+    /不能包含/
+  );
 
   const note = new TFile("note.md", "hello");
   const vault = new MockVault([note]);
@@ -203,6 +341,31 @@ async function run() {
   );
   await disabledPushEngine.sync();
   assert.deepEqual(disabledPushClient.uploaded, []);
+
+  const docxNote = new TFile("docx-note.md", "# 标题\n\n正文");
+  const docxClient = new MockClient(new Map([["docx-note.md", {
+    name: "docx-note.md",
+    token: "legacy-file-token",
+    type: "file",
+    parentToken: "root",
+    modifiedTime: 1000
+  }]]));
+  const docxSettings = settings();
+  docxSettings.markdownMode = "docx";
+  const docxEngine = new SyncEngine(
+    new MockVault([docxNote]),
+    docxClient,
+    () => docxSettings,
+    state(),
+    async () => {},
+    () => {}
+  );
+  const docxStats = await docxEngine.syncSelected(["docx-note.md"]);
+  assert.equal(docxStats.uploaded, 1);
+  assert.equal(docxClient.uploaded[0].type, "docx");
+  assert.equal(docxClient.uploaded[0].name, "docx-note");
+  assert.equal(docxClient.uploaded[0].previousToken, undefined);
+  assert.match(docxClient.uploaded[0].prepared.content, /# 标题/);
 
   fs.rmSync(tempDirectory, { recursive: true, force: true });
   console.log("sync-engine tests passed");
